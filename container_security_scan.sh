@@ -93,16 +93,21 @@ container_exec() {
     local cmd="$@"
 
     if [ "$CONTAINER_RUNTIME" = "docker" ]; then
-        container_exec "$container" sh -c "$cmd"
+        docker exec "$container" sh -c "$cmd" 2>/dev/null
     elif [ "$CONTAINER_RUNTIME" = "crictl" ]; then
         local container_id="${CONTAINER_NAME_TO_ID[$container]}"
         if [ -z "$container_id" ]; then
             container_id="$container"
         fi
-        # 使用crictl exec
-        crictl exec "$container_id" sh -c "$cmd" 2>/dev/null || \
-        # 或者使用nsenter
-        nsenter -t $(crictl inspect "$container_id" | grep -o '"pid": [0-9]*' | awk '{print $2}') -- sh -c "$cmd" 2>/dev/null
+        # 先尝试crictl exec
+        if crictl exec "$container_id" sh -c "$cmd" 2>/dev/null; then
+            return 0
+        fi
+        # 如果crictl exec失败，尝试nsenter
+        local pid=$(crictl inspect "$container_id" 2>/dev/null | grep -o '"pid": [0-9]*' | head -1 | awk '{print $2}')
+        if [ -n "$pid" ]; then
+            nsenter -t "$pid" -- sh -c "$cmd" 2>/dev/null
+        fi
     fi
 }
 
@@ -126,7 +131,7 @@ container_port() {
     local container="$1"
 
     if [ "$CONTAINER_RUNTIME" = "docker" ]; then
-        container_port "$container" 2>/dev/null
+        docker port "$container" 2>/dev/null
     elif [ "$CONTAINER_RUNTIME" = "crictl" ]; then
         local container_id="${CONTAINER_NAME_TO_ID[$container]}"
         [ -z "$container_id" ] && container_id="$container"
@@ -241,10 +246,13 @@ check_zero_ip_exposure() {
     log_info "开始检查容器内的 0.0.0.0 绑定..."
 
     for container in $CONTAINERS; do
-        local ports=$(container_port "$container" 2>/dev/null | grep "0.0.0.0" || true)
-        if [ -n "$ports" ]; then
+        local ports=$(container_port "$container" 2>/dev/null)
+        log_info "容器 [$container] 端口映射: ${ports:-无}"
+        if echo "$ports" | grep -q "0.0.0.0"; then
             log_warning "容器 [$container] 绑定到 0.0.0.0"
             echo "  端口映射: $ports" >> "$REPORT_FILE"
+        else
+            log_success "容器 [$container] 未绑定到 0.0.0.0"
         fi
     done
 }
@@ -256,9 +264,14 @@ check_ssl_certificates() {
     log_info "开始检查容器内证书..."
 
     for container in $CONTAINERS; do
-        local certs=$(container_exec "$container" find /etc -name "*.pem" -o -name "*.crt" 2>/dev/null | head -5 || true)
+        local certs=$(container_exec "$container" "find /etc -name '*.pem' -o -name '*.crt' 2>/dev/null | head -5" 2>/dev/null || true)
         if [ -n "$certs" ]; then
-            log_info "容器 [$container] 发现证书文件"
+            log_info "容器 [$container] 发现证书文件:"
+            echo "$certs" | while read cert; do
+                [ -n "$cert" ] && echo "    - $cert" >> "$REPORT_FILE"
+            done
+        else
+            log_info "容器 [$container] 未发现证书文件"
         fi
     done
 }
@@ -270,14 +283,28 @@ check_cipher_suites() {
     log_info "开始检查加密套件配置..."
 
     for container in $CONTAINERS; do
-        local nginx_check=$(container_exec "$container" which nginx 2>/dev/null || true)
+        local nginx_check=$(container_exec "$container" "which nginx 2>/dev/null" || true)
         if [ -n "$nginx_check" ]; then
-            local ssl_ciphers=$(container_exec "$container" sh -c "nginx -T 2>/dev/null | grep -i ssl_ciphers" 2>/dev/null || true)
+            log_info "容器 [$container] 发现Nginx: $nginx_check"
+            local ssl_ciphers=$(container_exec "$container" "nginx -T 2>/dev/null | grep -i ssl_ciphers" 2>/dev/null || true)
             if [ -n "$ssl_ciphers" ]; then
-                for weak in RC4 DES 3DES MD5; do
-                    echo "$ssl_ciphers" | grep -qi "$weak" && log_error "容器 [$container] 发现弱加密套件: $weak"
+                log_info "容器 [$container] 加密套件配置:"
+                echo "  \`\`\`" >> "$REPORT_FILE"
+                echo "$ssl_ciphers" >> "$REPORT_FILE"
+                echo "  \`\`\`" >> "$REPORT_FILE"
+                local found_weak=false
+                for weak in RC4 DES 3DES MD5 NULL EXPORT; do
+                    if echo "$ssl_ciphers" | grep -qi "$weak"; then
+                        log_error "容器 [$container] 发现弱加密套件: $weak"
+                        found_weak=true
+                    fi
                 done
+                [ "$found_weak" = false ] && log_success "容器 [$container] 未发现弱加密套件"
+            else
+                log_info "容器 [$container] 未配置ssl_ciphers"
             fi
+        else
+            log_info "容器 [$container] 未安装Nginx"
         fi
     done
 }
@@ -288,17 +315,35 @@ check_sensitive_info() {
     echo "## 4. 敏感信息泄露检查" >> "$REPORT_FILE"
     log_info "开始检查容器内敏感信息..."
 
-    local patterns="password passwd secret api_key token private_key"
+    local patterns="password passwd secret api_key token private_key access_key secret_key"
 
     for container in $CONTAINERS; do
+        log_info "检查容器 [$container] 环境变量..."
+        local env_output=$(container_exec "$container" "env 2>/dev/null" || true)
+        local found_sensitive=false
+
         for pattern in $patterns; do
-            local found=$(container_exec "$container" env 2>/dev/null | grep -i "$pattern" || true)
-            [ -n "$found" ] && log_warning "容器 [$container] 发现敏感环境变量: $pattern"
+            local found=$(echo "$env_output" | grep -i "$pattern" || true)
+            if [ -n "$found" ]; then
+                log_warning "容器 [$container] 发现敏感环境变量: $pattern"
+                echo "    匹配行: $(echo "$found" | cut -c1-50)..." >> "$REPORT_FILE"
+                found_sensitive=true
+            fi
         done
 
+        [ "$found_sensitive" = false ] && log_success "容器 [$container] 未发现敏感环境变量"
+
         # SSH私钥检查
-        local keys=$(container_exec "$container" find / -name "id_rsa" 2>/dev/null | head -3 || true)
-        [ -n "$keys" ] && log_warning "容器 [$container] 发现SSH私钥"
+        log_info "检查容器 [$container] SSH私钥..."
+        local keys=$(container_exec "$container" "find / -name 'id_rsa' 2>/dev/null | head -3" || true)
+        if [ -n "$keys" ]; then
+            log_warning "容器 [$container] 发现SSH私钥:"
+            echo "$keys" | while read key; do
+                [ -n "$key" ] && echo "    - $key" >> "$REPORT_FILE"
+            done
+        else
+            log_success "容器 [$container] 未发现SSH私钥"
+        fi
     done
 }
 
@@ -667,11 +712,16 @@ check_ports() {
     echo "## 6. 端口暴露检查" >> "$REPORT_FILE"
     log_info "开始扫描容器端口..."
 
-    echo "### 容器端口映射" >> "$REPORT_FILE"
     for container in $CONTAINERS; do
         local ports=$(container_port "$container" 2>/dev/null || true)
-        echo "容器 [$container]:" >> "$REPORT_FILE"
-        echo "$ports" >> "$REPORT_FILE"
+        if [ -n "$ports" ]; then
+            log_info "容器 [$container] 端口映射:"
+            echo "  \`\`\`" >> "$REPORT_FILE"
+            echo "$ports" >> "$REPORT_FILE"
+            echo "  \`\`\`" >> "$REPORT_FILE"
+        else
+            log_info "容器 [$container] 无端口映射或无法获取"
+        fi
     done
 }
 
@@ -685,26 +735,45 @@ check_container_baseline() {
         echo "### 容器 [$container]" >> "$REPORT_FILE"
 
         # 运行用户
-        local user=$(container_exec "$container" whoami 2>/dev/null || echo "unknown")
-        [ "$user" == "root" ] && log_warning "容器 [$container] 以root用户运行 (D_IAM_48_1)" || log_success "容器 [$container] 以非root用户运行"
+        local user=$(container_exec "$container" "whoami 2>/dev/null" || echo "unknown")
+        log_info "容器 [$container] 运行用户: $user"
+        [ "$user" == "root" ] && log_warning "容器 [$container] 以root用户运行 (D_IAM_48_1)" || log_success "容器 [$container] 以非root用户($user)运行"
 
-        # 特权模式
-        local priv=$(container_inspect "$container" --format '{{.HostConfig.Privileged}}' 2>/dev/null || echo "false")
+        # 特权模式 - 需要从宿主机检查
+        if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+            local priv=$(docker inspect "$container" --format '{{.HostConfig.Privileged}}' 2>/dev/null || echo "false")
+        elif [ "$CONTAINER_RUNTIME" = "crictl" ]; then
+            local container_id="${CONTAINER_NAME_TO_ID[$container]}"
+            [ -z "$container_id" ] && container_id="$container"
+            local priv=$(crictl inspect "$container_id" 2>/dev/null | grep -o '"privileged": [^,]*' | head -1 | awk '{print $2}' || echo "false")
+        fi
         [ "$priv" == "true" ] && log_error "容器 [$container] 运行在特权模式" || log_success "容器 [$container] 未运行在特权模式"
 
-        # 资源限制
-        local mem=$(container_inspect "$container" --format '{{.HostConfig.Memory}}' 2>/dev/null || echo "0")
+        # 资源限制 - 需要从宿主机检查
+        if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+            local mem=$(docker inspect "$container" --format '{{.HostConfig.Memory}}' 2>/dev/null || echo "0")
+            local cpu=$(docker inspect "$container" --format '{{.HostConfig.CpuQuota}}' 2>/dev/null || echo "0")
+            local net=$(docker inspect "$container" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null || echo "default")
+            local ro=$(docker inspect "$container" --format '{{.HostConfig.ReadonlyRootfs}}' 2>/dev/null || echo "false")
+        elif [ "$CONTAINER_RUNTIME" = "crictl" ]; then
+            local container_id="${CONTAINER_NAME_TO_ID[$container]}"
+            [ -z "$container_id" ] && container_id="$container"
+            local inspect_json=$(crictl inspect "$container_id" 2>/dev/null)
+            local mem=$(echo "$inspect_json" | grep -o '"memory": [^,]*' | head -1 | awk -F'[ :]' '{print $3}' | tr -d ',' || echo "0")
+            local cpu=$(echo "$inspect_json" | grep -o '"cpu_quota": [^,]*' | head -1 | awk -F'[ :]' '{print $3}' | tr -d ',' || echo "0")
+            local net=$(echo "$inspect_json" | grep -o '"network_mode": "[^"]*"' | head -1 | cut -d'"' -f4 || echo "default")
+            local ro=$(echo "$inspect_json" | grep -o '"readonly_rootfs": [^,]*' | head -1 | awk '{print $2}' || echo "false")
+        fi
+
+        log_info "容器 [$container] 内存限制: ${mem:-0} bytes"
         [ "$mem" == "0" ] && log_warning "容器 [$container] 未设置内存限制" || log_success "容器 [$container] 已设置内存限制"
 
-        local cpu=$(container_inspect "$container" --format '{{.HostConfig.CpuQuota}}' 2>/dev/null || echo "0")
+        log_info "容器 [$container] CPU限制: ${cpu:-0}"
         [ "$cpu" == "0" ] && log_warning "容器 [$container] 未设置CPU限制" || log_success "容器 [$container] 已设置CPU限制"
 
-        # 网络模式
-        local net=$(container_inspect "$container" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null || echo "default")
-        [ "$net" == "host" ] && log_error "容器 [$container] 使用host网络模式" || log_info "容器 [$container] 网络模式: $net"
+        log_info "容器 [$container] 网络模式: ${net:-default}"
+        [ "$net" == "host" ] && log_error "容器 [$container] 使用host网络模式" || log_success "容器 [$container] 网络模式: $net"
 
-        # 只读根文件系统
-        local ro=$(container_inspect "$container" --format '{{.HostConfig.ReadonlyRootfs}}' 2>/dev/null || echo "false")
         [ "$ro" == "true" ] && log_success "容器 [$container] 根文件系统为只读" || log_warning "容器 [$container] 根文件系统可写"
     done
 }
@@ -728,8 +797,13 @@ check_md5_password_security() {
     log_info "开始检查MD5密码..."
 
     for container in $CONTAINERS; do
-        local md5=$(container_exec "$container" grep -E '\$1\$' /etc/shadow 2>/dev/null || true)
-        [ -n "$md5" ] && log_error "容器 [$container] 使用MD5加密密码" || log_success "容器 [$container] 未使用MD5加密密码"
+        local md5=$(container_exec "$container" "grep -E '\\\$1\\\$' /etc/shadow 2>/dev/null" || true)
+        if [ -n "$md5" ]; then
+            log_error "容器 [$container] 使用MD5加密密码"
+            echo "  发现行数: $(echo "$md5" | wc -l)" >> "$REPORT_FILE"
+        else
+            log_success "容器 [$container] 未使用MD5加密密码"
+        fi
     done
 }
 
@@ -739,17 +813,22 @@ check_residual_tools() {
     echo "## 10. 安全残留工具检查 (D_SCS_5_4)" >> "$REPORT_FILE"
     log_info "开始检查容器内安全工具..."
 
-    local tools="gcc g++ make nmap netcat tcpdump gdb john hydra"
+    local tools="gcc g++ make nmap netcat tcpdump gdb john hydra curl wget"
 
     for container in $CONTAINERS; do
-        local found=0
+        log_info "检查容器 [$container] 安全工具..."
+        local found_tools=""
         for tool in $tools; do
-            if container_exec "$container" which "$tool" 2>/dev/null; then
-                log_warning "容器 [$container] 包含安全工具: $tool"
-                found=1
+            local tool_path=$(container_exec "$container" "which $tool 2>/dev/null" || true)
+            if [ -n "$tool_path" ]; then
+                found_tools="$found_tools $tool($tool_path)"
             fi
         done
-        [ $found -eq 0 ] && log_success "容器 [$container] 未发现高危安全工具"
+        if [ -n "$found_tools" ]; then
+            log_warning "容器 [$container] 包含安全工具:$found_tools"
+        else
+            log_success "容器 [$container] 未发现高危安全工具"
+        fi
     done
 }
 
@@ -760,44 +839,79 @@ check_debug_tools() {
     log_info "开始检查容器内调试工具..."
 
     for container in $CONTAINERS; do
-        local debug_tools=$(container_exec "$container" sh -c "find / -name 'tcpdump' -o -name 'sniffer' -o -name 'nmap' -o -name 'wireshark' -o -name 'netcat' -o -name 'gdb' -o -name 'strace' -o -name 'readelf' -o -name 'ethereal' -o -name 'cpp' -o -name 'gcc' -o -name 'dexdump' -o -name 'mirror' -o -name 'jdk' -o -name 'javac' -o -name 'go' -o -name 'dlv' -o -name 'ld' -o -name 'lex' -o -name 'rpcgen' -o -name 'php' -o -name 'binutils' -o -name 'flex' -o -name 'glibc' -o -name 'aplay' -o -name 'ar' -o -name 'arecord' -o -name 'atop' -o -name 'cmake' -o -name 'Dev-cpp' -o -name 'iftop' -o -name 'jsoncpp' -o -name 'make' -o -name 'mcpp' -o -name 'nc' -o -name 'ncat' -o -name 'nload' -o -name 'objdump' -o -name 'perf' -o -name 'rpm-build' -o -name 'vnstat' -o -name 'vnstatsvg' -o -name 'telnetd' -o -name 'libtool' -o -name 'sdk' -o -name 'npm' -o -name 'npx' -o -name 'node-inspector' -o -name 'corepack' -o -name 'pdb.py' -o -name 'bdb.py' -o -name 'trace.py' -o -name 'tracemalloc.py' -o -name 'timeit.py' 2>/dev/null | sort" 2>/dev/null || true)
+        log_info "扫描容器 [$container] 调试工具..."
+        local debug_tools=$(container_exec "$container" "find / -type f \( -name 'tcpdump' -o -name 'gdb' -o -name 'strace' -o -name 'nmap' -o -name 'wireshark' -o -name 'gcc' -o -name 'g++' -o -name 'make' -o -name 'cmake' -o -name 'perf' \) 2>/dev/null | head -20" || true)
 
         if [ -n "$debug_tools" ]; then
-            log_warning "容器 [$container] 发现调试工具"
+            local count=$(echo "$debug_tools" | wc -l)
+            log_warning "容器 [$container] 发现 $count 个调试工具"
             echo "  发现的工具:" >> "$REPORT_FILE"
-            echo "\`\`\`" >> "$REPORT_FILE"
+            echo "  \`\`\`" >> "$REPORT_FILE"
             echo "$debug_tools" >> "$REPORT_FILE"
-            echo "\`\`\`" >> "$REPORT_FILE"
+            echo "  \`\`\`" >> "$REPORT_FILE"
         else
             log_success "容器 [$container] 未发现调试工具"
         fi
     done
 }
 
-# ==================== 11. 用户权限检查 ====================
+# ==================== 12. 用户权限检查 ====================
 check_user_permissions() {
     echo "" >> "$REPORT_FILE"
-    echo "## 11. 用户权限检查" >> "$REPORT_FILE"
+    echo "## 12. 用户权限检查" >> "$REPORT_FILE"
     log_info "开始检查容器内用户权限..."
 
     for container in $CONTAINERS; do
         # UID为0的账户
-        local uid0=$(container_exec "$container" awk -F: '$3 == 0 {print $1}' /etc/passwd 2>/dev/null || true)
-        [ "$uid0" != "root" ] && [ -n "$uid0" ] && log_warning "容器 [$container] 发现多个UID为0账户: $uid0"
+        local uid0=$(container_exec "$container" "awk -F: '\$3 == 0 {print \$1}' /etc/passwd 2>/dev/null" || true)
+        if [ -n "$uid0" ] && [ "$uid0" != "root" ]; then
+            log_warning "容器 [$container] 发现多个UID为0账户: $uid0"
+        else
+            log_success "容器 [$container] 仅root账户UID为0"
+        fi
 
         # 口令期限
-        local maxdays=$(container_exec "$container" grep "^PASS_MAX_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}' || true)
-        [ "$maxdays" -gt "90" ] 2>/dev/null && log_warning "容器 [$container] 口令期限过长: $maxdays 天"
+        local maxdays=$(container_exec "$container" "grep '^PASS_MAX_DAYS' /etc/login.defs 2>/dev/null | awk '{print \$2}'" || true)
+        if [ -n "$maxdays" ]; then
+            log_info "容器 [$container] 口令期限: $maxdays 天"
+            [ "$maxdays" -gt "90" ] 2>/dev/null && log_warning "容器 [$container] 口令期限过长: $maxdays 天" || log_success "容器 [$container] 口令期限符合规范"
+        else
+            log_info "容器 [$container] 无法获取口令期限配置"
+        fi
     done
 }
 
-# ==================== 12. 文件权限检查 ====================
+# ==================== 13. 文件权限检查 ====================
 check_file_permissions() {
     echo "" >> "$REPORT_FILE"
-    echo "## 12. 文件权限检查" >> "$REPORT_FILE"
+    echo "## 13. 文件权限检查" >> "$REPORT_FILE"
     log_info "开始检查容器内文件权限..."
 
     for container in $CONTAINERS; do
+        # 敏感文件权限
+        local shadow_perm=$(container_exec "$container" "stat -c '%a' /etc/shadow 2>/dev/null" || true)
+        if [ -n "$shadow_perm" ]; then
+            log_info "容器 [$container] /etc/shadow 权限: $shadow_perm"
+            [ "$shadow_perm" -le "640" ] 2>/dev/null && log_success "容器 [$container] shadow文件权限安全" || log_warning "容器 [$container] shadow文件权限过宽"
+        else
+            log_info "容器 [$container] 无法获取shadow权限"
+        fi
+
+        # passwd文件权限
+        local passwd_perm=$(container_exec "$container" "stat -c '%a' /etc/passwd 2>/dev/null" || true)
+        if [ -n "$passwd_perm" ]; then
+            log_info "容器 [$container] /etc/passwd 权限: $passwd_perm"
+        fi
+
+        # 无属主文件
+        local noowner=$(container_exec "$container" "find /etc -nouser -o -nogroup 2>/dev/null | head -3" || true)
+        if [ -n "$noowner" ]; then
+            log_warning "容器 [$container] 发现无属主文件"
+        else
+            log_success "容器 [$container] 未发现无属主文件"
+        fi
+    done
+}
         # 敏感文件权限
         local shadow_perm=$(container_exec "$container" stat -c "%a" /etc/shadow 2>/dev/null || true)
         log_info "容器 [$container] /etc/shadow 权限: $shadow_perm"
@@ -808,32 +922,49 @@ check_file_permissions() {
     done
 }
 
-# ==================== 13. 暴力破解防护检查 ====================
+# ==================== 14. 暴力破解防护检查 ====================
 check_brute_force_protection() {
     echo "" >> "$REPORT_FILE"
-    echo "## 13. 暴力破解防护检查 (D_SCS_2_10)" >> "$REPORT_FILE"
+    echo "## 14. 暴力破解防护检查 (D_SCS_2_10)" >> "$REPORT_FILE"
     log_info "开始检查容器内暴力破解防护..."
 
     for container in $CONTAINERS; do
-        container_exec "$container" which fail2ban-server 2>/dev/null && log_success "容器 [$container] 已安装fail2ban" || log_warning "容器 [$container] 未安装fail2ban"
+        local fail2ban=$(container_exec "$container" "which fail2ban-server 2>/dev/null" || true)
+        if [ -n "$fail2ban" ]; then
+            log_success "容器 [$container] 已安装fail2ban: $fail2ban"
+        else
+            log_warning "容器 [$container] 未安装fail2ban"
+        fi
     done
 }
 
-# ==================== 14. 不安全函数检查 ====================
+# ==================== 15. 不安全函数检查 ====================
 check_unsafe_functions() {
     echo "" >> "$REPORT_FILE"
-    echo "## 14. 不安全函数检查 (RL_13_1_2_1)" >> "$REPORT_FILE"
+    echo "## 15. 不安全函数检查 (RL_13_1_2_1)" >> "$REPORT_FILE"
     log_info "开始检查代码中不安全函数..."
 
     local unsafe_funcs="strcpy strcat sprintf gets scanf"
 
     for container in $CONTAINERS; do
-        local cfiles=$(container_exec "$container" find /app /home /root -name "*.c" 2>/dev/null | head -10 || true)
+        log_info "扫描容器 [$container] C代码文件..."
+        local cfiles=$(container_exec "$container" "find /app /home /root -name '*.c' 2>/dev/null | head -10" || true)
+        if [ -z "$cfiles" ]; then
+            log_info "容器 [$container] 未发现C代码文件"
+            continue
+        fi
+
+        local found_unsafe=false
         for file in $cfiles; do
             for func in $unsafe_funcs; do
-                container_exec "$container" grep -l "$func" "$file" 2>/dev/null && log_warning "容器 [$container] 发现不安全函数 $func: $file"
+                local match=$(container_exec "$container" "grep -l '$func' '$file' 2>/dev/null" || true)
+                if [ -n "$match" ]; then
+                    log_warning "容器 [$container] 发现不安全函数 $func: $file"
+                    found_unsafe=true
+                fi
             done
         done
+        [ "$found_unsafe" = false ] && log_success "容器 [$container] 未发现不安全函数"
     done
 }
 
@@ -871,7 +1002,7 @@ main() {
 
     echo -e "${BLUE}"
     echo "========================================"
-    echo "    容器安全扫描工具 v2.2"
+    echo "    容器安全扫描工具 v2.3"
     echo "========================================"
     echo -e "${NC}"
 
@@ -879,8 +1010,7 @@ main() {
 
     echo -e "${BLUE}目标容器:${NC}"
     for c in $CONTAINERS; do
-        local img=$(container_inspect "$c" --format '{{.Config.Image}}' 2>/dev/null || echo "?")
-        echo -e "  - ${GREEN}$c${NC} ($img)"
+        echo -e "  - ${GREEN}$c${NC}"
     done
     echo ""
 
