@@ -21,6 +21,8 @@ TARGET_CONTAINERS=""
 
 # 容器运行时 (auto/docker/crictl)
 CONTAINER_RUNTIME=""
+# 是否安装工具
+INSTALL_TOOLS=true
 
 # 输出目录
 REPORT_DIR="/tmp/container_security_scan_$(date +%Y%m%d_%H%M%S)"
@@ -55,6 +57,7 @@ show_help() {
     echo "  -l, --list          列出所有运行中的容器"
     echo "  -r, --runtime       指定容器运行时: auto(默认)/docker/crictl"
     echo "  -m, --mode MODE     设置扫描模式: container(默认)/host/all"
+    echo "  --skip-install      跳过容器内工具安装"
     echo ""
     echo "示例:"
     echo "  $0                        # 扫描所有容器"
@@ -108,6 +111,56 @@ container_exec() {
         if [ -n "$pid" ]; then
             nsenter -t "$pid" -- sh -c "$cmd" 2>/dev/null
         fi
+    fi
+}
+
+# 在容器内安装必要工具
+install_container_tools() {
+    local container="$1"
+
+    log_info "检查容器 [$container] 必要工具..."
+
+    # 检测包管理器并安装工具
+    local pkg_manager=""
+    local install_cmd=""
+
+    # 检测apt (Debian/Ubuntu)
+    if container_exec "$container" "which apt-get 2>/dev/null" >/dev/null 2>&1; then
+        pkg_manager="apt"
+        install_cmd="apt-get update -qq && apt-get install -y -qq coreutils findutils grep gawk"
+    # 检测yum (CentOS/RHEL)
+    elif container_exec "$container" "which yum 2>/dev/null" >/dev/null 2>&1; then
+        pkg_manager="yum"
+        install_cmd="yum install -y -q coreutils findutils grep gawk"
+    # 检测apk (Alpine)
+    elif container_exec "$container" "which apk 2>/dev/null" >/dev/null 2>&1; then
+        pkg_manager="apk"
+        install_cmd="apk add --no-cache coreutils findutils grep gawk"
+    # 检测dnf (Fedora)
+    elif container_exec "$container" "which dnf 2>/dev/null" >/dev/null 2>&1; then
+        pkg_manager="dnf"
+        install_cmd="dnf install -y -q coreutils findutils grep gawk"
+    fi
+
+    # 检查必要工具是否存在
+    local tools_missing=false
+    for tool in find stat grep awk; do
+        if ! container_exec "$container" "which $tool 2>/dev/null" >/dev/null 2>&1; then
+            tools_missing=true
+            break
+        fi
+    done
+
+    if [ "$tools_missing" = true ] && [ -n "$pkg_manager" ]; then
+        log_info "容器 [$container] 缺少必要工具，尝试临时安装 ($pkg_manager)..."
+        container_exec "$container" "$install_cmd" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            log_success "容器 [$container] 工具安装成功"
+        else
+            log_warning "容器 [$container] 工具安装失败，部分检查可能不完整"
+        fi
+    else
+        log_success "容器 [$container] 必要工具已存在"
     fi
 }
 
@@ -167,6 +220,7 @@ parse_args() {
             -m|--mode)
                 [ -n "$2" ] && SCAN_MODE="$2" && shift 2 || { echo -e "${RED}错误: --mode 需要参数${NC}"; exit 1; }
                 ;;
+            --skip-install) INSTALL_TOOLS=false; shift ;;
             -*)
                 echo -e "${RED}未知选项: $1${NC}"; show_help ;;
             *)
@@ -912,15 +966,6 @@ check_file_permissions() {
         fi
     done
 }
-        # 敏感文件权限
-        local shadow_perm=$(container_exec "$container" stat -c "%a" /etc/shadow 2>/dev/null || true)
-        log_info "容器 [$container] /etc/shadow 权限: $shadow_perm"
-
-        # 无属主文件
-        local noowner=$(container_exec "$container" find /etc -nouser -o -nogroup 2>/dev/null | head -3 || true)
-        [ -n "$noowner" ] && log_warning "容器 [$container] 发现无属主文件"
-    done
-}
 
 # ==================== 14. 暴力破解防护检查 ====================
 check_brute_force_protection() {
@@ -1015,6 +1060,15 @@ main() {
     echo ""
 
     init_report
+
+    # 为每个容器安装必要工具
+    if [ "$INSTALL_TOOLS" = true ]; then
+        for container in $CONTAINERS; do
+            install_container_tools "$container"
+        done
+    else
+        log_info "跳过容器内工具安装"
+    fi
 
     check_zero_ip_exposure
     check_ssl_certificates
