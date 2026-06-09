@@ -322,7 +322,12 @@ log_cmd() {
 }
 log_result() {
     local result="$1"
-    echo -e "  ${CYAN}→ 结果:${NC} ${result:0:100}${#result gt 100 && echo "..."}"
+    local len=${#result}
+    if [ $len -gt 100 ]; then
+        echo -e "  ${CYAN}→ 结果:${NC} ${result:0:100}..."
+    else
+        echo -e "  ${CYAN}→ 结果:${NC} $result"
+    fi
     echo "  结果: $result" >> "$REPORT_FILE"
 }
 log_detail() {
@@ -340,7 +345,8 @@ check_zero_ip_exposure() {
         echo "" >> "$REPORT_FILE"
         echo "### 容器: $container" >> "$REPORT_FILE"
 
-        # 执行端口查询命令
+        # ===== 外部端口映射检查 =====
+        log_info "=== 外部端口映射检查 ==="
         local cmd="docker port $container 2>/dev/null || crictl port $container 2>/dev/null"
         log_cmd "查询容器端口映射" "$cmd"
 
@@ -354,14 +360,40 @@ check_zero_ip_exposure() {
         done
         echo "  \`\`\`" >> "$REPORT_FILE"
 
-        # 分析结果
+        # 分析外部端口映射
         if echo "$ports" | grep -q "0.0.0.0"; then
             local bind_ports=$(echo "$ports" | grep "0.0.0.0" | awk '{print $1}' | tr '\n' ' ')
-            log_error "容器 [$container] 绑定到 0.0.0.0，存在外部暴露风险"
+            log_error "容器 [$container] 外部端口绑定到 0.0.0.0"
             log_detail "暴露端口: $bind_ports"
-            log_detail "风险说明: 0.0.0.0绑定允许任意IP访问，应绑定到特定IP如127.0.0.1"
+            log_detail "风险说明: 0.0.0.0绑定允许任意IP访问"
         else
-            log_success "容器 [$container] 未绑定到 0.0.0.0，端口配置安全"
+            log_success "容器 [$container] 外部端口映射安全"
+        fi
+
+        # ===== 容器内部监听端口检查 =====
+        echo ""
+        log_info "=== 容器内部监听端口检查 ==="
+        log_cmd "netstat -tunlp 2>/dev/null || ss -tunlp" "获取容器内部监听端口"
+
+        local listen_ports=$(container_exec "$container" "netstat -tunlp 2>/dev/null || ss -tunlp 2>/dev/null" || true)
+
+        if [ -n "$listen_ports" ]; then
+            echo -e "  ${CYAN}→ 容器内部监听端口:${NC}"
+            echo "  \`\`\`" >> "$REPORT_FILE"
+            echo "$listen_ports" >> "$REPORT_FILE"
+            echo "  \`\`\`" >> "$REPORT_FILE"
+
+            # 检查监听地址
+            echo "$listen_ports" | grep -E "0\.0\.0\.0:|:::" | while read line; do
+                local addr=$(echo "$line" | awk '{print $4}')
+                local pid=$(echo "$line" | awk '{print $7}')
+                if [[ "$addr" == 0.0.0.0* ]] || [[ "$addr" == ::* ]]; then
+                    log_warning "容器内部监听 0.0.0.0: $addr (进程: $pid)"
+                    log_detail "说明: 这是容器内部监听，K8s环境下正常行为"
+                fi
+            done
+        else
+            log_info "容器 [$container] 无法获取内部监听端口"
         fi
     done
 }
@@ -436,17 +468,39 @@ check_cipher_suites() {
         echo "" >> "$REPORT_FILE"
         echo "### 容器: $container" >> "$REPORT_FILE"
 
-        # 检查是否安装Nginx
-        local cmd="which nginx"
-        log_cmd "检查Nginx安装" "$cmd"
-        local nginx_check=$(container_exec "$container" "which nginx 2>/dev/null" || true)
+        # 多种方式检测Nginx
+        log_cmd "which nginx || find / -name nginx -type f 2>/dev/null | head -3" "检查Nginx安装"
+        local nginx_check=$(container_exec "$container" "which nginx 2>/dev/null || find /usr /etc /opt -name 'nginx' -type f 2>/dev/null | head -1" || true)
+
+        # 如果which找不到，尝试通过进程检测
+        if [ -z "$nginx_check" ]; then
+            local nginx_proc=$(container_exec "$container" "ps aux 2>/dev/null | grep -E '[n]ginx' | head -1" || true)
+            if [ -n "$nginx_proc" ]; then
+                log_info "容器 [$container] 通过进程检测到Nginx运行中"
+                log_detail "$nginx_proc"
+                nginx_check="running"
+            fi
+        fi
+
+        # 尝试直接执行nginx命令检测
+        if [ -z "$nginx_check" ]; then
+            local nginx_test=$(container_exec "$container" "nginx -v 2>&1" || true)
+            if echo "$nginx_test" | grep -qi "nginx version"; then
+                log_info "容器 [$container] 检测到Nginx: $nginx_test"
+                nginx_check="detected"
+            fi
+        fi
 
         if [ -n "$nginx_check" ]; then
             log_info "容器 [$container] 发现Nginx: $nginx_check"
 
+            # 获取Nginx版本
+            log_cmd "nginx -v" "获取Nginx版本"
+            local nginx_ver=$(container_exec "$container" "nginx -v 2>&1" || true)
+            log_result "$nginx_ver"
+
             # 获取Nginx配置中的SSL加密套件
-            cmd="nginx -T 2>/dev/null | grep -iE 'ssl_(cipher|protocol|prefer)'"
-            log_cmd "获取SSL配置" "$cmd"
+            log_cmd "nginx -T 2>/dev/null | grep -iE 'ssl_(cipher|protocol|prefer)'" "获取SSL配置"
             local ssl_config=$(container_exec "$container" "nginx -T 2>/dev/null | grep -iE 'ssl_(cipher|protocol|prefer)'" 2>/dev/null || true)
 
             if [ -n "$ssl_config" ]; then
@@ -582,9 +636,28 @@ check_nginx_security() {
         echo "" >> "$REPORT_FILE"
         echo "### 容器: $container" >> "$REPORT_FILE"
 
-        # 检查是否安装Nginx
-        log_cmd "which nginx" "检查Nginx安装"
-        local nginx_check=$(container_exec "$container" which nginx 2>/dev/null || true)
+        # 多种方式检测Nginx
+        log_cmd "which nginx || find / -name nginx -type f 2>/dev/null" "检查Nginx安装"
+        local nginx_check=$(container_exec "$container" "which nginx 2>/dev/null || find /usr /etc /opt -name 'nginx' -type f 2>/dev/null | head -1" || true)
+
+        # 如果which找不到，尝试通过进程检测
+        if [ -z "$nginx_check" ]; then
+            local nginx_proc=$(container_exec "$container" "ps aux 2>/dev/null | grep -E '[n]ginx' | head -1" || true)
+            if [ -n "$nginx_proc" ]; then
+                log_info "容器 [$container] 通过进程检测到Nginx运行中"
+                log_detail "$nginx_proc"
+                nginx_check="running"
+            fi
+        fi
+
+        # 尝试直接执行nginx命令检测
+        if [ -z "$nginx_check" ]; then
+            local nginx_test=$(container_exec "$container" "nginx -v 2>&1" || true)
+            if echo "$nginx_test" | grep -qi "nginx version"; then
+                log_info "容器 [$container] 检测到Nginx"
+                nginx_check="detected"
+            fi
+        fi
 
         if [ -z "$nginx_check" ]; then
             log_info "容器 [$container] 未安装Nginx，跳过检查"
@@ -840,6 +913,8 @@ check_ports() {
         echo "" >> "$REPORT_FILE"
         echo "### 容器: $container" >> "$REPORT_FILE"
 
+        # ===== 外部端口映射 =====
+        log_info "=== 外部端口映射 ==="
         log_cmd "docker port $container 或 crictl port $container" "获取端口映射"
 
         local ports=$(container_port "$container" 2>/dev/null || true)
@@ -874,7 +949,37 @@ check_ports() {
                 fi
             done
         else
-            log_info "容器 [$container] 无端口映射"
+            log_info "容器 [$container] 无外部端口映射"
+        fi
+
+        # ===== 容器内部监听端口 =====
+        echo ""
+        log_info "=== 容器内部监听端口 ==="
+        log_cmd "netstat -tunlp 2>/dev/null || ss -tunlp" "获取容器内部监听端口"
+
+        local listen_ports=$(container_exec "$container" "netstat -tunlp 2>/dev/null || ss -tunlp 2>/dev/null" || true)
+
+        if [ -n "$listen_ports" ]; then
+            echo -e "  ${CYAN}→ 容器内部监听:${NC}"
+            echo "  \`\`\`" >> "$REPORT_FILE"
+            echo "$listen_ports" >> "$REPORT_FILE"
+            echo "  \`\`\`" >> "$REPORT_FILE"
+
+            # 分析监听地址
+            echo "$listen_ports" | grep -E "LISTEN" | while read line; do
+                local addr=$(echo "$line" | awk '{print $4}')
+                local pid_prog=$(echo "$line" | awk '{print $7}')
+
+                if [[ "$addr" == 0.0.0.0* ]]; then
+                    local port_num=$(echo "$addr" | cut -d: -f2)
+                    log_info "监听 0.0.0.0:$port_num (进程: $pid_prog) - K8s环境正常"
+                elif [[ "$addr" == 127.0.0.1* ]] || [[ "$addr" == ::1* ]]; then
+                    local port_num=$(echo "$addr" | cut -d: -f2)
+                    log_success "仅监听本地: $port_num"
+                fi
+            done
+        else
+            log_info "容器 [$container] 无法获取内部监听端口"
         fi
     done
 }
