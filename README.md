@@ -1,16 +1,35 @@
-# 容器环境安全扫描工具 v2.2
+# 容器环境安全扫描工具 v2.4
 
 ## 项目简介
 
 本工具用于对宿主机下的容器环境进行全面安全扫描，基于行业标准安全规范，自动化检测潜在的安全风险。
 
+**v2.4 更新内容:**
+- 详细输出每个检查项的执行命令、原始结果和分析结论
+- 新增 `sec_env_scan.sh` 容器环境批量扫描入口脚本
+- 新增 `single_container_scanner.sh` 单容器深度扫描脚本
+- 支持指定容器名称进行扫描
+- 支持 Docker 和 crictl(containerd) 两种容器运行时
+- 支持 `--skip-install` 参数跳过容器内工具安装
+- Nginx 48项安全规范完整检查
+- 增强的报告格式，包含风险说明和修复建议
+
 ## 工具列表
 
 | 脚本 | 功能 | 用法 |
 |------|------|------|
-| `container_security_scan.sh` | 容器安全扫描 | `./container_security_scan.sh [容器名...]` |
+| `container_security_scan.sh` | 容器安全扫描(详细版) | `./container_security_scan.sh [容器名...]` |
+| `sec_env_scan.sh` | 容器环境批量扫描入口 | `./sec_env_scan.sh [-c 容器名]` |
+| `single_container_scanner.sh` | 单容器深度扫描 | 通过nsenter注入执行 |
 | `repo_security_scan.sh` | 代码仓库安全扫描 | `./repo_security_scan.sh <仓库路径>` |
 | `nginx_security_scan.sh` | Nginx安全规范专项扫描 | `./nginx_security_scan.sh -c <配置文件>` |
+
+## 支持的容器运行时
+
+| 运行时 | 命令 | 支持状态 |
+|--------|------|----------|
+| Docker | `docker ps` | ✅ 完全支持 |
+| containerd/CRI | `crictl ps` | ✅ 支持(使用nsenter) |
 
 ## 支持的扫描规范
 
@@ -92,38 +111,46 @@
 
 ## 扫描模块列表
 
-| 序号 | 模块名称 | 包含规范 |
+### container_security_scan.sh (15个模块)
+
+| 序号 | 模块名称 | 输出内容 |
 |------|---------|---------|
-| 1 | 全零IP暴露检查 | Nginx_2_2_6, D_SCS_3_1 |
-| 2 | SSL/TLS证书检查 | D_IAM_55_1, D_IAM_53_1, D_IAM_53_2, D_IAM_62_1 |
-| 3 | 加密套件检查 | Nginx_2_7_4, D_CAS_8_1, D_CAS_2_2, D_CAS_2_1, D_CAS_25_1, Nginx_2_7_3 |
-| 4 | 敏感信息泄露检查 | Other_1_2, Other_1_1, Other_1_4, Other_1_5, D_IAM_17_3 |
-| 5 | Nginx安全配置检查 | Nginx_2_1_2, Nginx_2_1_3, Nginx_2_2_1, Nginx_2_2_4, Nginx_2_2_8, Nginx_2_2_9, Nginx_2_2_10, Nginx_2_4_1, Nginx_2_6_1, Nginx_2_7_1, Nginx_2_7_2, Nginx_2_8_1 |
-| 6 | 端口暴露检查 | D_SCS_3_1 |
-| 7 | 容器安全基线检查 | D_IAM_48_1 |
-| 8 | 镜像安全检查 | - |
-| 9 | 网络安全检查 | D_IDS_1_1 |
-| 10 | 日志与审计检查 | D_IAM_36_1, D_LUS_5_1, D_LUS_5_2 |
-| 11 | MD5密码安全检查 | D_CAS_2_4 |
-| 12 | 代码口令硬编码检查 | D_IAM_12_5, D_KMS_5_1 |
-| 13 | 安全椭圆曲线检查 | Nginx_2_7_5 |
-| 14 | Base64编码加密检查 | D_CAS_1_4 |
-| 15 | 用户权限检查 | D_IAM_3_1, D_IAM_27_2, D_IAM_37_5, D_IAM_42_3, D_IAM_16_1, D_IAM_9_1, D_IAM_10_1, D_IAM_46_1 |
-| 16 | 文件权限检查 | D_IAM_49_1, D_IAM_42_1, Nginx_2_3_1, Nginx_2_3_2, D_IAM_44_1 |
-| 17 | 密钥长度检查 | D_IAM_54_1, D_IAM_54_2, D_CAS_2_5, D_CAS_2_6 |
-| 18 | SSH配置检查 | D_CAS_26_1 |
-| 19 | 不安全函数检查 | RL_13_1_2_1 |
-| 20 | 公网IP硬编码检查 | public_ip_check, D_SCS_4_2 |
-| 21 | 证书签名算法检查 | D_IAM_53_1, D_IAM_53_2, D_IAM_62_1 |
-| 22 | 会话安全检查 | D_SMS_16_1, D_IDS_2_2 |
-| 23 | 安全残留工具检查 | D_SCS_5_4 |
-| 24 | MyBatis配置检查 | D_IAM_45_1 |
-| 25 | 内存敏感信息扫描 | D_IAM_14_6 |
-| 26 | 暴力破解防护检查 | D_SCS_2_10 |
+| 1 | 全零IP暴露检查 | 端口映射详情、绑定地址分析、高危端口告警 |
+| 2 | SSL/TLS证书检查 | 证书路径、有效期、过期告警 |
+| 3 | 加密套件检查 | SSL配置、弱算法检测、协议版本分析 |
+| 4 | 敏感信息泄露检查 | 环境变量扫描、SSH私钥检测、配置文件发现 |
+| 5 | Nginx安全规范检查 | 48项规范逐项检查、配置详情、修复建议 |
+| 6 | 端口暴露检查 | 端口映射列表、高危端口告警 |
+| 7 | 容器安全基线检查 | 运行用户、特权模式、资源限制、Capabilities |
+| 8 | 镜像安全检查 | 镜像标签、大小、创建时间 |
+| 9 | MD5密码安全检查 | shadow文件分析、弱加密检测 |
+| 10 | 安全工具残留检查 | 编译器、调试器、网络工具检测 |
+| 11 | 调试工具扫描 | tcpdump、gdb、strace等调试工具 |
+| 12 | 用户权限检查 | UID=0账户、空密码、sudo配置 |
+| 13 | 文件权限检查 | shadow/passwd权限、SUID文件、无属主文件 |
+| 14 | 暴力破解防护检查 | fail2ban安装、PAM锁定策略 |
+| 15 | 不安全函数检查 | C/C++代码中危险函数检测 |
+
+### single_container_scanner.sh (深度扫描)
+
+| 序号 | 模块名称 | 功能说明 |
+|------|---------|---------|
+| 1 | 系统信息收集 | OS版本、内核信息 |
+| 2 | 包管理器检测 | apt/yum/apk自动检测 |
+| 3 | umask检查 | 默认权限配置检查 |
+| 4 | 挂载目录检查 | 目录非空、K8s token检测 |
+| 5 | 敏感文件检查 | 证书、配置文件权限 |
+| 6 | History配置检查 | 历史记录禁用检测 |
+| 7 | 进程安全检查 | PID 1、root进程检测 |
+| 8 | 环境变量检查 | Gitleaks敏感信息扫描 |
+| 9 | Sudo权限检查 | NOPASSWD配置检测 |
+| 10 | PATH安全性检查 | 可写命令文件检测 |
+| 11 | 网络端口检查 | SSL探测、加密套件分析 |
+| 12 | 调试工具检查 | 编译器、调试器检测 |
 
 ## 使用方法
 
-### 容器安全扫描
+### 容器安全扫描 (详细版)
 
 ```bash
 # 扫描所有运行中的容器
@@ -131,6 +158,12 @@
 
 # 扫描指定容器
 ./container_security_scan.sh nginx mysql
+
+# 使用crictl运行时
+./container_security_scan.sh -r crictl
+
+# 跳过容器内工具安装
+./container_security_scan.sh --skip-install
 
 # 列出所有容器
 ./container_security_scan.sh -l
@@ -140,6 +173,21 @@
 
 # 扫描结果保存在 /tmp/container_security_scan_* 目录
 # 报告格式: Markdown (security_report.md)
+```
+
+### 容器环境批量扫描
+
+```bash
+# 扫描所有容器
+./sec_env_scan.sh
+
+# 扫描指定容器
+./sec_env_scan.sh -c nginx
+
+# 使用crictl运行时
+./sec_env_scan.sh -r crictl
+
+# 结果保存: /root/sec_scanner_result_<hostname>.txt
 ```
 
 ### 代码仓库安全扫描
@@ -157,25 +205,6 @@
 # 扫描结果保存在 /tmp/repo_security_scan_* 目录
 ```
 
-#### 代码仓库扫描模块
-
-| 序号 | 模块名称 | 功能说明 |
-|------|---------|---------|
-| 1 | DOS漏洞检测 | 检测无限循环、大文件读取未限制等 |
-| 2 | ReDoS漏洞检测 | 检测危险的正则表达式模式 |
-| 3 | 代码质量检查 | 使用Semgrep进行静态分析 |
-| 4 | 不安全算法排查 | 检测MD5/SHA1/DES/RC4等弱加密算法 |
-| 5 | Web应用安全检查 | SQL注入、XSS、命令注入、路径遍历检测 |
-| 6 | Trivy漏洞扫描 | 依赖漏洞和文件系统漏洞扫描 |
-| 7 | Gitleaks敏感信息 | 检测API密钥、密码等敏感信息泄露 |
-
-#### 外部工具依赖
-
-脚本会自动安装以下工具:
-- **trivy** - 容器镜像和文件系统漏洞扫描
-- **gitleaks** - 敏感信息泄露扫描
-- **semgrep** - 静态代码分析
-
 ### Nginx安全规范专项扫描
 
 ```bash
@@ -189,33 +218,41 @@
 ./nginx_security_scan.sh -h
 ```
 
-#### Nginx规范检查项 (48项)
+## 输出报告格式
 
-**必须项 (高优先级):**
+### 控制台输出示例
 
-| 分类 | 检查项 |
-|------|--------|
-| 安装安全 | 删除缺省文件、最小化安装、禁止webDAV |
-| 网络绑定 | 绑定特定IP地址 |
-| 功能配置 | 禁用SSI、禁用不必要的HTTP方法 |
-| 账号安全 | 非特权账号运行、锁定账号、禁止登录shell |
-| 文件权限 | 目录550、配置440、日志640、PID文件640 |
-| 安全防护 | alias安全、try_files安全、CRLF注入防护 |
-| SSL/TLS | 安全协议、安全加密套件、会话缓存、OCSP |
-| 信息隐藏 | 隐藏版本、隐藏X-Powered-By、禁用目录列表 |
-| 日志审计 | 开启访问日志、错误日志 |
-| HTTP安全头 | X-Frame-Options、X-Content-Type-Options、HSTS等 |
+```
+[CMD] docker port nginx
+  → 结果:
+    0.0.0.0:80->80/tcp
+    0.0.0.0:443->443/tcp
 
-**建议项 (低优先级):**
+[WARN] 容器 [nginx] 绑定到 0.0.0.0，存在外部暴露风险
+    暴露端口: 80 443
+    风险说明: 0.0.0.0绑定允许任意IP访问，应绑定到特定IP如127.0.0.1
 
-- IP访问限制、防盗链、连接数限制、速率限制
-- 禁用隐藏文件服务、Referer策略配置等
+[PASS] 容器 [nginx] 未发现弱加密套件
+```
 
-## 输出报告
+### Markdown报告示例
 
-扫描完成后生成以下文件:
-- `security_report.md` - Markdown格式的详细报告，包含问题级别标记和规范编号
-- `security_report.json` - JSON格式报告(预留)
+```markdown
+## 1. 全零IP暴露检查 (Nginx_2_2_6)
+
+### 容器: nginx
+
+执行命令: `docker port nginx`
+
+```
+0.0.0.0:80->80/tcp
+0.0.0.0:443->443/tcp
+```
+
+- ❌ 容器 [nginx] 绑定到 0.0.0.0
+  - 风险: 0.0.0.0绑定允许任意IP访问
+  - 建议: 绑定到特定IP地址
+```
 
 ## 问题级别定义
 
@@ -225,6 +262,18 @@
 | 高危(High) | ❌ | 重要安全问题，如过期证书、弱加密套件、MD5密码 |
 | 中危(Medium) | ⚠️ | 需关注的问题，如全零IP暴露、未配置资源限制 |
 | 低危(Low) | 信息提示 | 建议改进的配置项 |
+
+## 外部工具依赖
+
+脚本会自动安装以下工具(如需要):
+
+| 工具 | 用途 | 安装方式 |
+|------|------|----------|
+| trivy | 容器镜像漏洞扫描 | 官方安装脚本 |
+| gitleaks | 敏感信息扫描 | GitHub下载二进制 |
+| semgrep | 静态代码分析 | pip安装 |
+| jq | JSON处理 | 包管理器/apt下载 |
+| nmap | 端口扫描 | 包管理器 |
 
 ## 关键安全建议
 
@@ -243,10 +292,24 @@
 - 配置安全响应头
 - 禁用目录列表和SSI功能
 
-### 用户权限
-- 禁止root远程SSH登录
-- 配置密码复杂度和使用期限
-- 设置合理的umask值(>=027)
+### 容器安全
+- 以非root用户运行容器
+- 设置资源限制(memory, cpu)
+- 使用只读根文件系统
+- 禁用特权模式
+- 使用自定义网络而非host网络
+
+## 白名单配置
+
+`sec_env_scan.sh` 支持以下白名单:
+
+```bash
+# 命名空间白名单
+NAMESPACE_WHITELIST="hss istio-system monitoring kube-system merlin"
+
+# Pod名称白名单
+POD_WHITELIST="vault super-scanner"
+```
 
 ## 后续扩展计划
 
@@ -256,3 +319,8 @@
 - [ ] 实时监控模式
 - [ ] JSON详细报告输出
 - [ ] 支持自定义扫描项
+- [ ] Web报告界面
+
+## License
+
+Apache-2.0

@@ -1,8 +1,9 @@
 #!/bin/bash
-# 容器安全扫描工具 v2.3
+# 容器安全扫描工具 v2.4
 # 基于安全规范要求的多项安全检查
 # 默认只扫描容器环境，支持指定特定容器
 # 支持Docker和crictl(containerd/CRI)两种容器运行时
+# 详细输出每个检查项的执行命令、原始结果和分析结论
 
 set -o pipefail
 
@@ -11,6 +12,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 # 扫描模式
@@ -47,7 +49,7 @@ declare -A CONTAINER_NAME_TO_ID
 
 # 显示帮助信息
 show_help() {
-    echo -e "${BLUE}容器安全扫描工具 v2.3${NC}"
+    echo -e "${BLUE}容器安全扫描工具 v2.4${NC}"
     echo ""
     echo "用法: $0 [选项] [容器名称...]"
     echo ""
@@ -59,11 +61,29 @@ show_help() {
     echo "  -m, --mode MODE     设置扫描模式: container(默认)/host/all"
     echo "  --skip-install      跳过容器内工具安装"
     echo ""
+    echo "扫描模块:"
+    echo "  1.  全零IP暴露检查"
+    echo "  2.  SSL/TLS证书检查"
+    echo "  3.  加密套件检查"
+    echo "  4.  敏感信息泄露检查"
+    echo "  5.  Nginx安全规范专项检查(48项)"
+    echo "  6.  端口暴露检查"
+    echo "  7.  容器安全基线检查"
+    echo "  8.  镜像安全检查"
+    echo "  9.  MD5密码安全检查"
+    echo "  10. 安全工具残留检查"
+    echo "  11. 调试工具扫描"
+    echo "  12. 用户权限检查"
+    echo "  13. 文件权限检查"
+    echo "  14. 暴力破解防护检查"
+    echo "  15. 不安全函数检查"
+    echo ""
     echo "示例:"
     echo "  $0                        # 扫描所有容器"
     echo "  $0 nginx mysql            # 仅扫描nginx和mysql容器"
     echo "  $0 -r crictl              # 使用crictl运行时扫描"
     echo "  $0 -l                     # 列出所有容器"
+    echo "  $0 --skip-install         # 跳过工具安装"
     exit 0
 }
 
@@ -293,6 +313,23 @@ log_success() { echo -e "${GREEN}[PASS]${NC} $1"; echo "  - ✅ $1" >> "$REPORT_
 log_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; echo "  - ⚠️ $1" >> "$REPORT_FILE"; MEDIUM_ISSUES=$((MEDIUM_ISSUES + 1)); TOTAL_ISSUES=$((TOTAL_ISSUES + 1)); }
 log_error() { echo -e "${RED}[FAIL]${NC} $1"; echo "  - ❌ $1" >> "$REPORT_FILE"; HIGH_ISSUES=$((HIGH_ISSUES + 1)); TOTAL_ISSUES=$((TOTAL_ISSUES + 1)); }
 
+# 详细日志函数 - 显示执行的命令和结果
+log_cmd() {
+    local desc="$1"
+    local cmd="$2"
+    echo -e "${BLUE}[CMD]${NC} $desc"
+    echo "  执行命令: \`$cmd\`" >> "$REPORT_FILE"
+}
+log_result() {
+    local result="$1"
+    echo -e "  ${CYAN}→ 结果:${NC} ${result:0:100}${#result gt 100 && echo "..."}"
+    echo "  结果: $result" >> "$REPORT_FILE"
+}
+log_detail() {
+    echo -e "    ${CYAN}$1${NC}"
+    echo "    $1" >> "$REPORT_FILE"
+}
+
 # ==================== 1. 全零IP暴露检查 ====================
 check_zero_ip_exposure() {
     echo "" >> "$REPORT_FILE"
@@ -300,13 +337,31 @@ check_zero_ip_exposure() {
     log_info "开始检查容器内的 0.0.0.0 绑定..."
 
     for container in $CONTAINERS; do
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
+        # 执行端口查询命令
+        local cmd="docker port $container 2>/dev/null || crictl port $container 2>/dev/null"
+        log_cmd "查询容器端口映射" "$cmd"
+
         local ports=$(container_port "$container" 2>/dev/null)
-        log_info "容器 [$container] 端口映射: ${ports:-无}"
+        local port_result="${ports:-无端口映射}"
+
+        echo -e "  ${CYAN}→ 原始结果:${NC}"
+        echo "  \`\`\`" >> "$REPORT_FILE"
+        echo "$port_result" | while read line; do
+            [ -n "$line" ] && echo -e "    ${CYAN}$line${NC}" && echo "    $line" >> "$REPORT_FILE"
+        done
+        echo "  \`\`\`" >> "$REPORT_FILE"
+
+        # 分析结果
         if echo "$ports" | grep -q "0.0.0.0"; then
-            log_warning "容器 [$container] 绑定到 0.0.0.0"
-            echo "  端口映射: $ports" >> "$REPORT_FILE"
+            local bind_ports=$(echo "$ports" | grep "0.0.0.0" | awk '{print $1}' | tr '\n' ' ')
+            log_error "容器 [$container] 绑定到 0.0.0.0，存在外部暴露风险"
+            log_detail "暴露端口: $bind_ports"
+            log_detail "风险说明: 0.0.0.0绑定允许任意IP访问，应绑定到特定IP如127.0.0.1"
         else
-            log_success "容器 [$container] 未绑定到 0.0.0.0"
+            log_success "容器 [$container] 未绑定到 0.0.0.0，端口配置安全"
         fi
     done
 }
@@ -318,14 +373,55 @@ check_ssl_certificates() {
     log_info "开始检查容器内证书..."
 
     for container in $CONTAINERS; do
-        local certs=$(container_exec "$container" "find /etc -name '*.pem' -o -name '*.crt' 2>/dev/null | head -5" 2>/dev/null || true)
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
+        # 查找证书文件
+        local cmd="find /etc /usr /opt -name '*.pem' -o -name '*.crt' -o -name '*.key' 2>/dev/null"
+        log_cmd "查找证书文件" "$cmd"
+
+        local certs=$(container_exec "$container" "find /etc /usr /opt -name '*.pem' -o -name '*.crt' 2>/dev/null | head -10" 2>/dev/null || true)
+
         if [ -n "$certs" ]; then
-            log_info "容器 [$container] 发现证书文件:"
+            local cert_count=$(echo "$certs" | wc -l)
+            log_info "容器 [$container] 发现 $cert_count 个证书文件:"
+            echo "  \`\`\`" >> "$REPORT_FILE"
             echo "$certs" | while read cert; do
-                [ -n "$cert" ] && echo "    - $cert" >> "$REPORT_FILE"
+                if [ -n "$cert" ]; then
+                    echo -e "    ${CYAN}$cert${NC}"
+                    echo "    $cert" >> "$REPORT_FILE"
+
+                    # 检查证书详情
+                    local cert_info=$(container_exec "$container" "openssl x509 -in '$cert' -noout -dates -subject 2>/dev/null" || true)
+                    if [ -n "$cert_info" ]; then
+                        echo -e "      ${CYAN}证书信息:${NC}"
+                        echo "$cert_info" | while read line; do
+                            echo -e "        ${CYAN}$line${NC}"
+                            echo "        $line" >> "$REPORT_FILE"
+                        done
+
+                        # 检查证书是否过期
+                        local end_date=$(echo "$cert_info" | grep "notAfter" | cut -d= -f2)
+                        if [ -n "$end_date" ]; then
+                            local expire_epoch=$(date -d "$end_date" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$end_date" +%s 2>/dev/null || echo "0")
+                            local now_epoch=$(date +%s)
+                            if [ "$expire_epoch" != "0" ] && [ "$expire_epoch" -lt "$now_epoch" ]; then
+                                log_error "证书已过期: $cert"
+                                log_detail "过期时间: $end_date"
+                            elif [ "$expire_epoch" != "0" ] && [ "$((expire_epoch - now_epoch))" -lt "2592000" ]; then
+                                log_warning "证书即将过期(30天内): $cert"
+                                log_detail "过期时间: $end_date"
+                            else
+                                log_success "证书有效期正常: $cert"
+                            fi
+                        fi
+                    fi
+                fi
             done
+            echo "  \`\`\`" >> "$REPORT_FILE"
         else
             log_info "容器 [$container] 未发现证书文件"
+            log_detail "可能不涉及HTTPS服务或证书挂载在其他位置"
         fi
     done
 }
@@ -337,28 +433,60 @@ check_cipher_suites() {
     log_info "开始检查加密套件配置..."
 
     for container in $CONTAINERS; do
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
+        # 检查是否安装Nginx
+        local cmd="which nginx"
+        log_cmd "检查Nginx安装" "$cmd"
         local nginx_check=$(container_exec "$container" "which nginx 2>/dev/null" || true)
+
         if [ -n "$nginx_check" ]; then
             log_info "容器 [$container] 发现Nginx: $nginx_check"
-            local ssl_ciphers=$(container_exec "$container" "nginx -T 2>/dev/null | grep -i ssl_ciphers" 2>/dev/null || true)
-            if [ -n "$ssl_ciphers" ]; then
-                log_info "容器 [$container] 加密套件配置:"
+
+            # 获取Nginx配置中的SSL加密套件
+            cmd="nginx -T 2>/dev/null | grep -iE 'ssl_(cipher|protocol|prefer)'"
+            log_cmd "获取SSL配置" "$cmd"
+            local ssl_config=$(container_exec "$container" "nginx -T 2>/dev/null | grep -iE 'ssl_(cipher|protocol|prefer)'" 2>/dev/null || true)
+
+            if [ -n "$ssl_config" ]; then
+                echo -e "  ${CYAN}→ SSL配置:${NC}"
+                echo "  \`\`\`nginx" >> "$REPORT_FILE"
+                echo "$ssl_config" | while read line; do
+                    [ -n "$line" ] && echo -e "    ${CYAN}$line${NC}" && echo "    $line" >> "$REPORT_FILE"
+                done
                 echo "  \`\`\`" >> "$REPORT_FILE"
-                echo "$ssl_ciphers" >> "$REPORT_FILE"
-                echo "  \`\`\`" >> "$REPORT_FILE"
+
+                # 分析加密套件安全性
                 local found_weak=false
-                for weak in RC4 DES 3DES MD5 NULL EXPORT; do
-                    if echo "$ssl_ciphers" | grep -qi "$weak"; then
-                        log_error "容器 [$container] 发现弱加密套件: $weak"
+                local weak_ciphers=""
+
+                for weak in RC4 DES 3DES MD5 NULL EXPORT aNULL SHA; do
+                    if echo "$ssl_config" | grep -qi "$weak"; then
                         found_weak=true
+                        weak_ciphers="$weak_ciphers $weak"
                     fi
                 done
-                [ "$found_weak" = false ] && log_success "容器 [$container] 未发现弱加密套件"
+
+                if [ "$found_weak" = true ]; then
+                    log_error "容器 [$container] 发现弱加密套件"
+                    log_detail "弱算法: $weak_ciphers"
+                    log_detail "建议: 使用 ECDHE+AESGCM 加密套件，禁用弱算法"
+                else
+                    log_success "容器 [$container] 未发现弱加密套件"
+                fi
+
+                # 检查SSL协议版本
+                if echo "$ssl_config" | grep -qi "SSLv3\|TLSv1\|TLSv1.1"; then
+                    log_warning "容器 [$container] 启用了不安全的SSL/TLS协议版本"
+                    log_detail "建议: 仅启用 TLSv1.2 和 TLSv1.3"
+                fi
             else
-                log_info "容器 [$container] 未配置ssl_ciphers"
+                log_info "容器 [$container] 未找到SSL配置"
+                log_detail "可能未配置HTTPS或配置文件位置不同"
             fi
         else
-            log_info "容器 [$container] 未安装Nginx"
+            log_info "容器 [$container] 未安装Nginx，跳过检查"
         fi
     done
 }
@@ -369,18 +497,32 @@ check_sensitive_info() {
     echo "## 4. 敏感信息泄露检查" >> "$REPORT_FILE"
     log_info "开始检查容器内敏感信息..."
 
-    local patterns="password passwd secret api_key token private_key access_key secret_key"
+    local patterns="password passwd secret api_key token private_key access_key secret_key credential auth_key"
 
     for container in $CONTAINERS; do
-        log_info "检查容器 [$container] 环境变量..."
-        local env_output=$(container_exec "$container" "env 2>/dev/null" || true)
-        local found_sensitive=false
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
 
+        # 检查环境变量
+        log_cmd "env" "获取容器环境变量"
+        local env_output=$(container_exec "$container" "env 2>/dev/null" || true)
+
+        echo -e "  ${CYAN}→ 环境变量数量: $(echo "$env_output" | wc -l)${NC}"
+
+        local found_sensitive=false
         for pattern in $patterns; do
             local found=$(echo "$env_output" | grep -i "$pattern" || true)
             if [ -n "$found" ]; then
-                log_warning "容器 [$container] 发现敏感环境变量: $pattern"
-                echo "    匹配行: $(echo "$found" | cut -c1-50)..." >> "$REPORT_FILE"
+                log_warning "容器 [$container] 发现敏感环境变量关键字: $pattern"
+                echo "  \`\`\`" >> "$REPORT_FILE"
+                echo "$found" | while read line; do
+                    # 隐藏敏感值
+                    local masked=$(echo "$line" | sed 's/=.*/=***(已隐藏)***/g')
+                    echo -e "    ${CYAN}$masked${NC}"
+                    echo "    $masked" >> "$REPORT_FILE"
+                done
+                echo "  \`\`\`" >> "$REPORT_FILE"
+                log_detail "风险: 敏感信息可能通过环境变量泄露"
                 found_sensitive=true
             fi
         done
@@ -388,15 +530,44 @@ check_sensitive_info() {
         [ "$found_sensitive" = false ] && log_success "容器 [$container] 未发现敏感环境变量"
 
         # SSH私钥检查
-        log_info "检查容器 [$container] SSH私钥..."
-        local keys=$(container_exec "$container" "find / -name 'id_rsa' 2>/dev/null | head -3" || true)
+        echo ""
+        log_cmd "find / -name 'id_rsa' -o -name 'id_dsa' -o -name '*.pem' -o -name '*.key'" "查找SSH私钥和证书文件"
+        local keys=$(container_exec "$container" "find / \( -name 'id_rsa' -o -name 'id_dsa' -o -name 'id_ed25519' \) -type f 2>/dev/null | head -10" || true)
+
         if [ -n "$keys" ]; then
             log_warning "容器 [$container] 发现SSH私钥:"
+            echo "  \`\`\`" >> "$REPORT_FILE"
             echo "$keys" | while read key; do
-                [ -n "$key" ] && echo "    - $key" >> "$REPORT_FILE"
+                if [ -n "$key" ]; then
+                    echo -e "    ${CYAN}$key${NC}"
+                    echo "    $key" >> "$REPORT_FILE"
+                    # 检查私钥权限
+                    local key_perm=$(container_exec "$container" "stat -c '%a %U:%G' '$key' 2>/dev/null" || true)
+                    if [ -n "$key_perm" ]; then
+                        log_detail "权限: $key_perm"
+                        if [[ "$key_perm" == 6* ]] || [[ "$key_perm" == 77* ]]; then
+                            log_error "私钥权限过宽，可能被其他用户读取"
+                        fi
+                    fi
+                fi
             done
+            echo "  \`\`\`" >> "$REPORT_FILE"
         else
             log_success "容器 [$container] 未发现SSH私钥"
+        fi
+
+        # 检查敏感配置文件
+        echo ""
+        log_cmd "find / -name '*.conf' -o -name '*.cfg' -o -name '*.ini' -o -name '*.yaml' -o -name '*.yml'" "查找配置文件"
+        local config_files=$(container_exec "$container" "find /opt /etc /app /home -type f \( -name 'application.yml' -o -name 'application.yaml' -o -name 'config.yml' -o -name 'settings.py' \) 2>/dev/null | head -10" || true)
+
+        if [ -n "$config_files" ]; then
+            log_info "容器 [$container] 发现敏感配置文件:"
+            echo "  \`\`\`" >> "$REPORT_FILE"
+            echo "$config_files" | while read cf; do
+                [ -n "$cf" ] && echo -e "    ${CYAN}$cf${NC}" && echo "    $cf" >> "$REPORT_FILE"
+            done
+            echo "  \`\`\`" >> "$REPORT_FILE"
         fi
     done
 }
@@ -408,355 +579,254 @@ check_nginx_security() {
     log_info "开始检查Nginx安全规范..."
 
     for container in $CONTAINERS; do
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
+        # 检查是否安装Nginx
+        log_cmd "which nginx" "检查Nginx安装"
         local nginx_check=$(container_exec "$container" which nginx 2>/dev/null || true)
-        if [ -n "$nginx_check" ]; then
-            local config=$(container_exec "$container" sh -c "nginx -T 2>/dev/null" 2>/dev/null || true)
-            echo "### 容器 [$container] Nginx配置检查" >> "$REPORT_FILE"
 
-            # ========== 安装安全检查 ==========
-            # 规范1: 删除缺省文件
-            local default_files="/etc/nginx/conf.d/default.conf /usr/share/nginx/html/index.html"
-            for f in $default_files; do
-                container_exec "$container" test -f "$f" 2>/dev/null && log_warning "容器 [$container] 存在缺省文件: $f (规范1)"
-            done
-
-            # 规范2: 检查模块数量(简化)
-            local module_count=$(container_exec "$container" nginx -V 2>&1 | grep -o "with-" | wc -l)
-            log_info "容器 [$container] 编译模块数: $module_count (规范2)"
-
-            # 规范3: 禁止webDAV
-            if container_exec "$container" nginx -V 2>&1 | grep -qi "http_dav_module"; then
-                log_error "容器 [$container] 安装了webDAV模块 (规范3)"
-            else
-                log_success "容器 [$container] 未安装webDAV模块 (规范3)"
-            fi
-
-            # ========== 网络绑定检查 ==========
-            # 规范4: 绑定特定IP
-            if echo "$config" | grep -E "listen\s+(\*:|\[::\]:|0\.0\.0\.0:)" > /dev/null 2>&1; then
-                log_error "容器 [$container] 监听地址绑定到通配符 (规范4)"
-            else
-                log_success "容器 [$container] 监听地址已绑定特定IP (规范4)"
-            fi
-
-            # ========== 功能配置检查 ==========
-            # 规范5: 禁用SSI
-            if echo "$config" | grep -E "ssi\s+on" > /dev/null 2>&1; then
-                log_error "容器 [$container] SSI功能已启用 (规范5)"
-            else
-                log_success "容器 [$container] SSI功能已禁用 (规范5)"
-            fi
-
-            # 规范17: 禁用不必要的HTTP方法
-            if echo "$config" | grep -E "if\s*\(\$request_method\s*~\s*\".*(TRACE|OPTIONS)" > /dev/null 2>&1; then
-                log_success "容器 [$container] 已限制不必要的HTTP方法 (规范17)"
-            else
-                log_error "容器 [$container] 未限制TRACE/OPTIONS方法 (规范17)"
-            fi
-
-            # ========== 账号安全检查 ==========
-            # 规范6: 运行用户
-            local nginx_user=$(echo "$config" | grep -E "^\s*user\s+" | head -1 | awk '{print $2}' | tr -d ';')
-            if [ -z "$nginx_user" ] || [ "$nginx_user" == "root" ]; then
-                log_error "容器 [$container] Nginx运行用户为root (规范6)"
-            else
-                log_success "容器 [$container] Nginx运行用户: $nginx_user (规范6)"
-
-                # 规范7: 账号锁定状态
-                local lock_status=$(container_exec "$container" passwd -S "$nginx_user" 2>/dev/null | awk '{print $2}')
-                if [ "$lock_status" == "L" ] || [ "$lock_status" == "LK" ]; then
-                    log_success "容器 [$container] 账号 $nginx_user 已锁定 (规范7)"
-                else
-                    log_warning "容器 [$container] 账号 $nginx_user 未锁定 (规范7)"
-                fi
-
-                # 规范8: 禁止登录shell
-                local shell=$(container_exec "$container" getent passwd "$nginx_user" 2>/dev/null | cut -d: -f7)
-                if [ "$shell" == "/sbin/nologin" ] || [ "$shell" == "/bin/false" ] || [ -z "$shell" ]; then
-                    log_success "容器 [$container] 账号 $nginx_user 禁止登录shell (规范8)"
-                else
-                    log_error "容器 [$container] 账号 $nginx_user 可登录shell (规范8)"
-                fi
-            fi
-
-            # ========== 文件权限检查 ==========
-            # 规范9: Nginx目录权限
-            local nginx_dir=$(container_exec "$container" nginx -V 2>&1 | grep -o "prefix=[^ ]*" | cut -d= -f2 | tr -d ' ')
-            [ -z "$nginx_dir" ] && nginx_dir="/etc/nginx"
-            local dir_perm=$(container_exec "$container" stat -c "%a" "$nginx_dir" 2>/dev/null || echo "755")
-            if [ "$dir_perm" -le "550" ]; then
-                log_success "容器 [$container] Nginx目录权限: $dir_perm (规范9)"
-            else
-                log_error "容器 [$container] Nginx目录权限过宽: $dir_perm (规范9)"
-            fi
-
-            # 规范10: 配置文件权限
-            local conf_perm=$(container_exec "$container" stat -c "%a" /etc/nginx/nginx.conf 2>/dev/null || echo "644")
-            if [ "$conf_perm" -le "640" ]; then
-                log_success "容器 [$container] 配置文件权限: $conf_perm (规范10)"
-            else
-                log_error "容器 [$container] 配置文件权限过宽: $conf_perm (规范10)"
-            fi
-
-            # 规范11: 日志文件权限
-            local log_dir="/var/log/nginx"
-            local log_issue=false
-            for logfile in access.log error.log; do
-                local log_perm=$(container_exec "$container" stat -c "%a" "$log_dir/$logfile" 2>/dev/null || echo "644")
-                if [ "$log_perm" -gt "640" ]; then
-                    log_error "容器 [$container] 日志文件权限过宽: $logfile ($log_perm) (规范11)"
-                    log_issue=true
-                fi
-            done
-            [ "$log_issue" = false ] && log_success "容器 [$container] 日志文件权限安全 (规范11)"
-
-            # 规范13: PID文件权限
-            local pid_file=$(echo "$config" | grep -E "^\s*pid\s+" | awk '{print $2}' | tr -d ';')
-            [ -z "$pid_file" ] && pid_file="/var/run/nginx.pid"
-            local pid_perm=$(container_exec "$container" stat -c "%a" "$pid_file" 2>/dev/null || echo "644")
-            if [ "$pid_perm" -le "640" ]; then
-                log_success "容器 [$container] PID文件权限: $pid_perm (规范13)"
-            else
-                log_warning "容器 [$container] PID文件权限: $pid_perm (规范13)"
-            fi
-
-            # ========== 安全漏洞防护检查 ==========
-            # 规范15: alias配置安全
-            if echo "$config" | grep -E "alias\s+[^;]*[^/];" > /dev/null 2>&1; then
-                log_error "容器 [$container] alias配置可能存在路径遍历风险 (规范15)"
-            else
-                log_success "容器 [$container] alias配置安全 (规范15)"
-            fi
-
-            # 规范16: try_files安全
-            if echo "$config" | grep -E "try_files\s+.*\.\." > /dev/null 2>&1; then
-                log_warning "容器 [$container] try_files可能存在跨目录风险 (规范16)"
-            else
-                log_success "容器 [$container] try_files配置安全 (规范16)"
-            fi
-
-            # 规范31: 禁止重定向到监听端口
-            if echo "$config" | grep -E "return\s+3[0-9]{2}\s+https?://\$host" > /dev/null 2>&1; then
-                log_warning "容器 [$container] 存在重定向配置，请确认安全性 (规范31)"
-            else
-                log_success "容器 [$container] 重定向配置安全 (规范31)"
-            fi
-
-            # 规范44: CRLF注入防护
-            if echo "$config" | grep -E 'rewrite.*\$uri|return.*\$uri' > /dev/null 2>&1; then
-                log_error "容器 [$container] 使用\$uri可能导致CRLF注入 (规范44)"
-            else
-                log_success "容器 [$container] CRLF注入防护安全 (规范44)"
-            fi
-
-            # ========== SSL/TLS安全检查 ==========
-            local ssl_enabled=$(echo "$config" | grep -E "listen\s+.*ssl|listen\s+.*443" | head -1)
-
-            if [ -n "$ssl_enabled" ]; then
-                # 规范21: 启用SSL
-                log_success "容器 [$container] 已启用SSL功能 (规范21)"
-
-                # 规范22: TLS协议版本
-                if echo "$config" | grep -E "ssl_protocols" > /dev/null 2>&1; then
-                    if echo "$config" | grep -E "ssl_protocols.*SSLv2|ssl_protocols.*SSLv3|ssl_protocols.*TLSv1[^\.]" > /dev/null 2>&1; then
-                        log_error "容器 [$container] 使用不安全的TLS协议 (规范22)"
-                    else
-                        log_success "容器 [$container] TLS协议版本安全 (规范22)"
-                    fi
-                else
-                    log_warning "容器 [$container] 未显式配置ssl_protocols (规范22)"
-                fi
-
-                # 规范23: 加密套件
-                if echo "$config" | grep -E "ssl_ciphers" > /dev/null 2>&1; then
-                    if echo "$config" | grep -iE "ssl_ciphers.*(RC4|DES|3DES|MD5|NULL|EXPORT|ANON)" > /dev/null 2>&1; then
-                        log_error "容器 [$container] 使用不安全的加密套件 (规范23)"
-                    else
-                        log_success "容器 [$container] 加密套件配置安全 (规范23)"
-                    fi
-                fi
-
-                # 规范24: DHE参数(3072位)
-                if echo "$config" | grep -E "ssl_dhparam" > /dev/null 2>&1; then
-                    log_success "容器 [$container] 已配置DHE参数 (规范24)"
-                else
-                    log_warning "容器 [$container] 未配置ssl_dhparam (规范24)"
-                fi
-
-                # 规范25: 超时时间
-                if echo "$config" | grep -E "ssl_session_timeout" > /dev/null 2>&1; then
-                    log_success "容器 [$container] 已配置SSL会话超时 (规范25)"
-                else
-                    log_warning "容器 [$container] 未配置ssl_session_timeout (规范25)"
-                fi
-
-                # 规范26: SSL会话缓存
-                if echo "$config" | grep -E "ssl_session_cache" > /dev/null 2>&1; then
-                    log_success "容器 [$container] 已配置SSL会话缓存 (规范26)"
-                else
-                    log_warning "容器 [$container] 未配置ssl_session_cache (规范26)"
-                fi
-
-                # 规范27: OCSP
-                if echo "$config" | grep -E "ssl_stapling\s+on" > /dev/null 2>&1; then
-                    log_success "容器 [$container] 已启用OCSP (规范27)"
-                else
-                    log_warning "容器 [$container] 未启用ssl_stapling (规范27)"
-                fi
-
-                # 规范41: 禁用会话恢复
-                if echo "$config" | grep -E "ssl_session_tickets\s+off" > /dev/null 2>&1; then
-                    log_success "容器 [$container] 已禁用SSL会话tickets (规范41)"
-                else
-                    log_warning "容器 [$container] 未禁用ssl_session_tickets (规范41)"
-                fi
-            else
-                log_warning "容器 [$container] 未检测到SSL配置 (规范21)"
-            fi
-
-            # ========== 请求限制检查 ==========
-            # 规范28: 网络超时
-            local timeout_ok=true
-            for setting in client_body_timeout client_header_timeout keepalive_timeout send_timeout; do
-                if ! echo "$config" | grep -E "$setting" > /dev/null 2>&1; then
-                    timeout_ok=false
-                fi
-            done
-            [ "$timeout_ok" = true ] && log_success "容器 [$container] 已配置网络超时 (规范28)" || log_warning "容器 [$container] 网络超时配置不完整 (规范28)"
-
-            # 规范30: 请求体大小限制
-            if echo "$config" | grep -E "client_max_body_size" > /dev/null 2>&1; then
-                log_success "容器 [$container] 已限制请求体大小 (规范30)"
-            else
-                log_error "容器 [$container] 未配置client_max_body_size (规范30)"
-            fi
-
-            # 规范35: 定制错误页面
-            if echo "$config" | grep -E "error_page" > /dev/null 2>&1; then
-                log_success "容器 [$container] 已配置自定义错误页面 (规范35)"
-            else
-                log_warning "容器 [$container] 未配置自定义错误页面 (规范35)"
-            fi
-
-            # ========== 信息隐藏检查 ==========
-            # 规范37: 隐藏X-Powered-By
-            if echo "$config" | grep -E "proxy_hide_header\s+X-Powered-By|fastcgi_hide_header\s+X-Powered-By" > /dev/null 2>&1; then
-                log_success "容器 [$container] 已隐藏X-Powered-By头 (规范37)"
-            else
-                log_warning "容器 [$container] 未配置隐藏X-Powered-By (规范37)"
-            fi
-
-            # 规范38: 隐藏版本信息
-            if echo "$config" | grep -E "server_tokens\s+off" > /dev/null 2>&1; then
-                log_success "容器 [$container] server_tokens 已关闭 (规范38)"
-            else
-                log_error "容器 [$container] server_tokens 未关闭 (规范38)"
-            fi
-
-            # 规范39: 禁用目录列表
-            if echo "$config" | grep -E "autoindex\s+on" > /dev/null 2>&1; then
-                log_error "容器 [$container] 启用了目录列表 (规范39)"
-            else
-                log_success "容器 [$container] 未启用目录列表 (规范39)"
-            fi
-
-            # ========== 日志审计检查 ==========
-            # 规范42: 开启日志
-            if echo "$config" | grep -E "access_log" | grep -v "off" > /dev/null 2>&1; then
-                log_success "容器 [$container] 已开启访问日志 (规范42)"
-            else
-                log_error "容器 [$container] 未开启访问日志 (规范42)"
-            fi
-            if echo "$config" | grep -E "error_log" | grep -v "off" > /dev/null 2>&1; then
-                log_success "容器 [$container] 已开启错误日志 (规范42)"
-            else
-                log_error "容器 [$container] 未开启错误日志 (规范42)"
-            fi
-
-            # 规范43: 日志详细记录
-            local log_format=$(echo "$config" | grep -E "log_format" | head -1)
-            if [ -n "$log_format" ]; then
-                log_success "容器 [$container] 已配置log_format (规范43)"
-            else
-                log_warning "容器 [$container] 未配置log_format (规范43)"
-            fi
-
-            # ========== HTTP安全头检查 ==========
-            # 规范45: 安全响应头
-            for header in X-Frame-Options X-Content-Type-Options X-XSS-Protection Strict-Transport-Security Content-Security-Policy; do
-                if echo "$config" | grep -qi "add_header\s+$header" > /dev/null 2>&1; then
-                    log_success "容器 [$container] 已配置 $header (规范45)"
-                else
-                    log_error "容器 [$container] 未配置 $header (规范45)"
-                fi
-            done
-
-            # ========== 建议项检查 ==========
-            # 规范14: Dump目录权限(建议)
-            # 规范18: 独立环境运行(需人工确认)
-            log_info "容器 [$container] 请确认不同实例在独立环境运行 (规范18)"
-
-            # 规范19: 限制访问IP(建议)
-            if echo "$config" | grep -E "allow\s+[0-9]+\.|deny\s+all" > /dev/null 2>&1; then
-                log_success "容器 [$container] 已配置IP访问限制 (规范19)"
-            else
-                log_warning "容器 [$container] 未配置IP访问限制 (规范19-建议)"
-            fi
-
-            # 规范20: 防盗链(建议)
-            if echo "$config" | grep -E "valid_referers" > /dev/null 2>&1; then
-                log_success "容器 [$container] 已配置防盗链 (规范20)"
-            else
-                log_warning "容器 [$container] 未配置防盗链 (规范20-建议)"
-            fi
-
-            # 规范29: 连接数限制(建议)
-            if echo "$config" | grep -E "limit_conn" > /dev/null 2>&1; then
-                log_success "容器 [$container] 已配置连接数限制 (规范29)"
-            else
-                log_warning "容器 [$container] 未配置连接数限制 (规范29-建议)"
-            fi
-
-            # 规范32: 并发数限制(建议)
-            if echo "$config" | grep -E "worker_connections" > /dev/null 2>&1; then
-                log_success "容器 [$container] 已配置worker_connections (规范32)"
-            else
-                log_warning "容器 [$container] 未配置worker_connections (规范32-建议)"
-            fi
-
-            # 规范33: 速率限制(建议)
-            if echo "$config" | grep -E "limit_req" > /dev/null 2>&1; then
-                log_success "容器 [$container] 已配置请求速率限制 (规范33)"
-            else
-                log_warning "容器 [$container] 未配置请求速率限制 (规范33-建议)"
-            fi
-
-            # 规范34: 请求体存储(建议)
-            if echo "$config" | grep -E "client_body_in_file_only\s+on" > /dev/null 2>&1; then
-                log_warning "容器 [$container] 开启了请求体存储到文件 (规范34-建议)"
-            else
-                log_success "容器 [$container] 未开启请求体存储到文件 (规范34)"
-            fi
-
-            # 规范36: 隐藏文件服务(建议)
-            if echo "$config" | grep -E "location\s+~\s*/\." > /dev/null 2>&1; then
-                log_success "容器 [$container] 已配置拒绝隐藏文件访问 (规范36)"
-            else
-                log_warning "容器 [$container] 未配置拒绝隐藏文件访问 (规范36-建议)"
-            fi
-
-            # 规范40: Referer配置(建议)
-            if echo "$config" | grep -E "valid_referers\s+none\s+blocked" > /dev/null 2>&1; then
-                log_success "容器 [$container] 已配置Referer策略 (规范40)"
-            else
-                log_warning "容器 [$容器] 未配置Referer策略 (规范40-建议)"
-            fi
-
-            # 规范46: CSRF防护(建议)
-            # 规范47: 响应头覆盖防护(建议)
-            # 规范48: URL仿冒防护(建议)
-            log_info "容器 [$container] 请人工确认CSRF/响应头覆盖/URL仿冒防护 (规范46-48)"
+        if [ -z "$nginx_check" ]; then
+            log_info "容器 [$container] 未安装Nginx，跳过检查"
+            continue
         fi
+
+        log_info "容器 [$container] 发现Nginx: $nginx_check"
+
+        # 获取Nginx版本
+        log_cmd "nginx -v" "获取Nginx版本"
+        local nginx_version=$(container_exec "$container" "nginx -v 2>&1" || true)
+        log_result "$nginx_version"
+
+        # 获取完整配置
+        log_cmd "nginx -T" "获取Nginx完整配置"
+        local config=$(container_exec "$container" sh -c "nginx -T 2>/dev/null" 2>/dev/null || true)
+        local config_lines=$(echo "$config" | wc -l)
+        log_result "配置行数: $config_lines"
+
+        # 显示关键配置片段
+        echo "  \`\`\`nginx" >> "$REPORT_FILE"
+        echo "# 关键配置片段:" >> "$REPORT_FILE"
+        echo "$config" | grep -E "^\s*(server\s*\{|listen\s+|server_name\s+|ssl_|location\s+)" | head -30 | while read line; do
+            echo "  $line" >> "$REPORT_FILE"
+        done
+        echo "  \`\`\`" >> "$REPORT_FILE"
+
+        # ========== 安装安全检查 ==========
+        echo ""
+        log_info "=== 安装安全检查 ==="
+
+        # 规范1: 删除缺省文件
+        log_cmd "test -f /etc/nginx/conf.d/default.conf" "检查缺省配置文件"
+        local default_files="/etc/nginx/conf.d/default.conf /usr/share/nginx/html/index.html"
+        for f in $default_files; do
+            if container_exec "$container" test -f "$f" 2>/dev/null; then
+                log_warning "容器 [$container] 存在缺省文件: $f (规范1)"
+                log_detail "风险: 缺省文件可能泄露服务器信息"
+            fi
+        done
+
+        # 规范2: 检查模块数量
+        log_cmd "nginx -V 2>&1 | grep -o 'with-' | wc -l" "检查编译模块数"
+        local module_count=$(container_exec "$container" nginx -V 2>&1 | grep -o "with-" | wc -l)
+        log_info "容器 [$container] 编译模块数: $module_count (规范2)"
+        log_detail "建议: 仅启用必要的模块，减少攻击面"
+
+        # 规范3: 禁止webDAV
+        log_cmd "nginx -V 2>&1 | grep -i 'http_dav_module'" "检查webDAV模块"
+        if container_exec "$container" nginx -V 2>&1 | grep -qi "http_dav_module"; then
+            log_error "容器 [$container] 安装了webDAV模块 (规范3)"
+            log_detail "风险: webDAV模块可能被滥用进行文件上传攻击"
+        else
+            log_success "容器 [$container] 未安装webDAV模块 (规范3)"
+        fi
+
+        # ========== 网络绑定检查 ==========
+        echo ""
+        log_info "=== 网络绑定检查 ==="
+
+        # 规范4: 绑定特定IP
+        log_cmd "grep -E 'listen\\s+(\\*:|\\[::\\]:|0\\.0\\.0\\.0:)' nginx.conf" "检查监听地址"
+        local listen_all=$(echo "$config" | grep -E "listen\s+(\*:|\[::\]:|0\.0\.0\.0:)" 2>/dev/null || true)
+        if [ -n "$listen_all" ]; then
+            log_error "容器 [$container] 监听地址绑定到通配符 (规范4)"
+            echo "$listen_all" | while read line; do
+                log_detail "发现: $line"
+            done
+            log_detail "风险: 绑定0.0.0.0可能暴露服务到所有网络接口"
+        else
+            log_success "容器 [$container] 监听地址已绑定特定IP (规范4)"
+        fi
+
+        # ========== 功能配置检查 ==========
+        echo ""
+        log_info "=== 功能配置检查 ==="
+
+        # 规范5: 禁用SSI
+        log_cmd "grep -E 'ssi\\s+on' nginx.conf" "检查SSI功能"
+        if echo "$config" | grep -E "ssi\s+on" > /dev/null 2>&1; then
+            log_error "容器 [$container] SSI功能已启用 (规范5)"
+            log_detail "风险: SSI可能被利用执行服务器端命令"
+        else
+            log_success "容器 [$container] SSI功能已禁用 (规范5)"
+        fi
+
+        # 规范17: 禁用不必要的HTTP方法
+        log_cmd "grep -E 'request_method.*TRACE|OPTIONS' nginx.conf" "检查HTTP方法限制"
+        if echo "$config" | grep -E "if\s*\(\$request_method\s*~\s*\".*(TRACE|OPTIONS)" > /dev/null 2>&1; then
+            log_success "容器 [$container] 已限制不必要的HTTP方法 (规范17)"
+        else
+            log_error "容器 [$container] 未限制TRACE/OPTIONS方法 (规范17)"
+            log_detail "风险: TRACE方法可能导致XST跨站跟踪攻击"
+            log_detail "建议: 添加 if (\$request_method ~ ^(TRACE|OPTIONS)) { return 405; }"
+        fi
+
+        # ========== 账号安全检查 ==========
+        echo ""
+        log_info "=== 账号安全检查 ==="
+
+        # 规范6: 运行用户
+        log_cmd "grep -E '^\\s*user\\s+' nginx.conf" "检查Nginx运行用户"
+        local nginx_user=$(echo "$config" | grep -E "^\s*user\s+" | head -1 | awk '{print $2}' | tr -d ';')
+        log_result "Nginx运行用户: ${nginx_user:-未配置(默认nobody)}"
+
+        if [ -z "$nginx_user" ] || [ "$nginx_user" == "root" ]; then
+            log_error "容器 [$container] Nginx运行用户为root (规范6)"
+            log_detail "风险: 以root运行nginx可能导致权限提升攻击"
+        else
+            log_success "容器 [$container] Nginx运行用户: $nginx_user (规范6)"
+
+            # 规范7: 账号锁定状态
+            log_cmd "passwd -S $nginx_user" "检查账号锁定状态"
+            local lock_status=$(container_exec "$container" passwd -S "$nginx_user" 2>/dev/null | awk '{print $2}')
+            if [ "$lock_status" == "L" ] || [ "$lock_status" == "LK" ]; then
+                log_success "容器 [$container] 账号 $nginx_user 已锁定 (规范7)"
+            else
+                log_warning "容器 [$container] 账号 $nginx_user 未锁定 (规范7)"
+                log_detail "建议: 执行 passwd -l $nginx_user 锁定账号"
+            fi
+
+            # 规范8: 禁止登录shell
+            log_cmd "getent passwd $nginx_user" "检查登录shell"
+            local shell=$(container_exec "$container" getent passwd "$nginx_user" 2>/dev/null | cut -d: -f7)
+            log_result "登录shell: $shell"
+            if [ "$shell" == "/sbin/nologin" ] || [ "$shell" == "/bin/false" ] || [ -z "$shell" ]; then
+                log_success "容器 [$container] 账号 $nginx_user 禁止登录shell (规范8)"
+            else
+                log_error "容器 [$container] 账号 $nginx_user 可登录shell: $shell (规范8)"
+                log_detail "建议: 修改 /etc/passwd 将shell改为 /sbin/nologin"
+            fi
+        fi
+
+        # ========== 文件权限检查 ==========
+        echo ""
+        log_info "=== 文件权限检查 ==="
+
+        # 规范9: Nginx目录权限
+        log_cmd "stat -c '%a' /etc/nginx" "检查Nginx目录权限"
+        local nginx_dir=$(container_exec "$container" nginx -V 2>&1 | grep -o "prefix=[^ ]*" | cut -d= -f2 | tr -d ' ')
+        [ -z "$nginx_dir" ] && nginx_dir="/etc/nginx"
+        local dir_perm=$(container_exec "$container" stat -c "%a" "$nginx_dir" 2>/dev/null || echo "755")
+        log_result "Nginx目录($nginx_dir)权限: $dir_perm"
+        if [ "$dir_perm" -le "550" ] 2>/dev/null; then
+            log_success "容器 [$container] Nginx目录权限安全 (规范9)"
+        else
+            log_error "容器 [$container] Nginx目录权限过宽: $dir_perm (规范9)"
+            log_detail "建议: chmod 550 $nginx_dir"
+        fi
+
+        # 规范10: 配置文件权限
+        log_cmd "stat -c '%a' /etc/nginx/nginx.conf" "检查配置文件权限"
+        local conf_perm=$(container_exec "$container" stat -c "%a" /etc/nginx/nginx.conf 2>/dev/null || echo "644")
+        log_result "nginx.conf权限: $conf_perm"
+        if [ "$conf_perm" -le "640" ] 2>/dev/null; then
+            log_success "容器 [$container] 配置文件权限安全 (规范10)"
+        else
+            log_error "容器 [$container] 配置文件权限过宽: $conf_perm (规范10)"
+            log_detail "建议: chmod 640 /etc/nginx/nginx.conf"
+        fi
+
+        # 规范11: 日志文件权限
+        log_cmd "stat -c '%a' /var/log/nginx/*.log" "检查日志文件权限"
+        local log_dir="/var/log/nginx"
+        local log_issue=false
+        for logfile in access.log error.log; do
+            local log_perm=$(container_exec "$container" stat -c "%a" "$log_dir/$logfile" 2>/dev/null || echo "644")
+            if [ "$log_perm" -gt "640" ] 2>/dev/null; then
+                log_error "容器 [$container] 日志文件权限过宽: $logfile ($log_perm) (规范11)"
+                log_issue=true
+            fi
+        done
+        [ "$log_issue" = false ] && log_success "容器 [$container] 日志文件权限安全 (规范11)"
+
+        # ========== SSL/TLS安全检查 ==========
+        echo ""
+        log_info "=== SSL/TLS安全检查 ==="
+
+        local ssl_enabled=$(echo "$config" | grep -E "listen\s+.*ssl|listen\s+.*443" | head -1)
+
+        if [ -n "$ssl_enabled" ]; then
+            log_success "容器 [$container] 已启用SSL功能 (规范21)"
+            log_detail "SSL配置: $ssl_enabled"
+
+            # 规范22: TLS协议版本
+            log_cmd "grep -E 'ssl_protocols' nginx.conf" "检查TLS协议版本"
+            local ssl_proto=$(echo "$config" | grep -E "ssl_protocols" | head -1)
+            if [ -n "$ssl_proto" ]; then
+                log_result "$ssl_proto"
+                if echo "$ssl_proto" | grep -E "SSLv2|SSLv3|TLSv1[^\.]" > /dev/null 2>&1; then
+                    log_error "容器 [$container] 使用不安全的TLS协议 (规范22)"
+                    log_detail "风险: SSLv2/v3和TLSv1.0存在已知漏洞"
+                else
+                    log_success "容器 [$container] TLS协议版本安全 (规范22)"
+                fi
+            else
+                log_warning "容器 [$container] 未显式配置ssl_protocols (规范22)"
+                log_detail "建议: 添加 ssl_protocols TLSv1.2 TLSv1.3;"
+            fi
+
+            # 规范23: 加密套件
+            log_cmd "grep -E 'ssl_ciphers' nginx.conf" "检查加密套件"
+            local ssl_ciphers=$(echo "$config" | grep -E "ssl_ciphers" | head -1)
+            if [ -n "$ssl_ciphers" ]; then
+                log_result "已配置加密套件"
+                if echo "$ssl_ciphers" | grep -iE "RC4|DES|3DES|MD5|NULL|EXPORT|ANON" > /dev/null 2>&1; then
+                    log_error "容器 [$container] 使用不安全的加密套件 (规范23)"
+                    log_detail "风险: 弱加密算法可能被破解"
+                else
+                    log_success "容器 [$container] 加密套件配置安全 (规范23)"
+                fi
+            else
+                log_warning "容器 [$container] 未配置ssl_ciphers (规范23)"
+            fi
+
+            # 规范24-27: 其他SSL配置
+            echo "$config" | grep -E "ssl_dhparam|ssl_session_timeout|ssl_session_cache|ssl_stapling" | while read line; do
+                log_detail "$line"
+            done
+        else
+            log_info "容器 [$container] 未启用SSL功能"
+        fi
+
+        # ========== 安全头配置检查 ==========
+        echo ""
+        log_info "=== 安全头配置检查 ==="
+
+        # 检查安全响应头
+        local security_headers="X-Frame-Options X-Content-Type-Options X-XSS-Protection Strict-Transport-Security Content-Security-Policy"
+
+        for header in $security_headers; do
+            log_cmd "grep -i 'add_header.*$header' nginx.conf" "检查 $header"
+            if echo "$config" | grep -i "add_header.*$header" > /dev/null 2>&1; then
+                local header_value=$(echo "$config" | grep -i "add_header.*$header" | head -1)
+                log_success "容器 [$container] 已配置 $header"
+                log_detail "$header_value"
+            else
+                log_warning "容器 [$container] 未配置 $header"
+            fi
+        done
+
+        log_info "容器 [$container] Nginx安全规范检查完成"
     done
 }
 
@@ -767,14 +837,44 @@ check_ports() {
     log_info "开始扫描容器端口..."
 
     for container in $CONTAINERS; do
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
+        log_cmd "docker port $container 或 crictl port $container" "获取端口映射"
+
         local ports=$(container_port "$container" 2>/dev/null || true)
+
         if [ -n "$ports" ]; then
-            log_info "容器 [$container] 端口映射:"
+            echo -e "  ${CYAN}→ 端口映射结果:${NC}"
             echo "  \`\`\`" >> "$REPORT_FILE"
-            echo "$ports" >> "$REPORT_FILE"
+            echo "$ports" | while read line; do
+                [ -n "$line" ] && echo -e "    ${CYAN}$line${NC}" && echo "    $line" >> "$REPORT_FILE"
+
+                # 分析绑定地址
+                local bind_ip=$(echo "$line" | awk -F: '{print $1}')
+                local bind_port=$(echo "$line" | awk -F: '{print $2}')
+
+                if [[ "$bind_ip" == "0.0.0.0" ]] || [[ "$bind_ip" == "::" ]]; then
+                    log_warning "端口 $bind_port 绑定到所有接口 ($bind_ip)"
+                    log_detail "风险: 暴露到所有网络接口，可能被外部访问"
+                fi
+            done
             echo "  \`\`\`" >> "$REPORT_FILE"
+
+            # 统计端口数量
+            local port_count=$(echo "$ports" | grep -c ":" 2>/dev/null || echo "0")
+            log_result "共 $port_count 个端口映射"
+
+            # 检查高危端口
+            local high_risk_ports="22 23 3389 5900 5901 6379 27017 9200 5672"
+            for hr_port in $high_risk_ports; do
+                if echo "$ports" | grep -q ":$hr_port"; then
+                    log_warning "发现高危端口暴露: $hr_port"
+                    log_detail "风险: 端口 $hr_port 可能被攻击者利用"
+                fi
+            done
         else
-            log_info "容器 [$container] 无端口映射或无法获取"
+            log_info "容器 [$container] 无端口映射"
         fi
     done
 }
@@ -786,14 +886,31 @@ check_container_baseline() {
     log_info "开始容器安全基线检查..."
 
     for container in $CONTAINERS; do
-        echo "### 容器 [$container]" >> "$REPORT_FILE"
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
 
-        # 运行用户
+        # ===== 运行用户检查 =====
+        log_cmd "whoami" "检查容器运行用户"
         local user=$(container_exec "$container" "whoami 2>/dev/null" || echo "unknown")
-        log_info "容器 [$container] 运行用户: $user"
-        [ "$user" == "root" ] && log_warning "容器 [$container] 以root用户运行 (D_IAM_48_1)" || log_success "容器 [$container] 以非root用户($user)运行"
+        log_result "当前用户: $user"
 
-        # 特权模式 - 需要从宿主机检查
+        if [ "$user" == "root" ]; then
+            log_warning "容器 [$container] 以root用户运行 (D_IAM_48_1)"
+            log_detail "风险: 以root运行可能导致容器逃逸风险"
+            log_detail "建议: 在Dockerfile中使用USER指令指定非root用户"
+        else
+            log_success "容器 [$container] 以非root用户($user)运行"
+
+            # 显示用户详细信息
+            log_cmd "id" "获取用户ID信息"
+            local user_info=$(container_exec "$container" "id 2>/dev/null" || true)
+            [ -n "$user_info" ] && log_detail "$user_info"
+        fi
+
+        # ===== 特权模式检查 =====
+        echo ""
+        log_cmd "docker inspect --format '{{.HostConfig.Privileged}}'" "检查特权模式"
+
         if [ "$CONTAINER_RUNTIME" = "docker" ]; then
             local priv=$(docker inspect "$container" --format '{{.HostConfig.Privileged}}' 2>/dev/null || echo "false")
         elif [ "$CONTAINER_RUNTIME" = "crictl" ]; then
@@ -801,34 +918,111 @@ check_container_baseline() {
             [ -z "$container_id" ] && container_id="$container"
             local priv=$(crictl inspect "$container_id" 2>/dev/null | grep -o '"privileged": [^,]*' | head -1 | awk '{print $2}' || echo "false")
         fi
-        [ "$priv" == "true" ] && log_error "容器 [$container] 运行在特权模式" || log_success "容器 [$container] 未运行在特权模式"
 
-        # 资源限制 - 需要从宿主机检查
+        log_result "特权模式: $priv"
+        if [ "$priv" == "true" ]; then
+            log_error "容器 [$container] 运行在特权模式"
+            log_detail "风险: 特权容器拥有宿主机所有能力，可能导致容器逃逸"
+            log_detail "建议: 移除--privileged参数，仅添加必要的capabilities"
+        else
+            log_success "容器 [$container] 未运行在特权模式"
+        fi
+
+        # ===== 资源限制检查 =====
+        echo ""
+        log_cmd "docker inspect --format 'Memory/CpuQuota/NetworkMode/ReadonlyRootfs'" "检查资源限制"
+
         if [ "$CONTAINER_RUNTIME" = "docker" ]; then
             local mem=$(docker inspect "$container" --format '{{.HostConfig.Memory}}' 2>/dev/null || echo "0")
             local cpu=$(docker inspect "$container" --format '{{.HostConfig.CpuQuota}}' 2>/dev/null || echo "0")
+            local cpu_period=$(docker inspect "$container" --format '{{.HostConfig.CpuPeriod}}' 2>/dev/null || echo "0")
             local net=$(docker inspect "$container" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null || echo "default")
             local ro=$(docker inspect "$container" --format '{{.HostConfig.ReadonlyRootfs}}' 2>/dev/null || echo "false")
+            local pid_limit=$(docker inspect "$container" --format '{{.HostConfig.PidsLimit}}' 2>/dev/null || echo "0")
         elif [ "$CONTAINER_RUNTIME" = "crictl" ]; then
             local container_id="${CONTAINER_NAME_TO_ID[$container]}"
             [ -z "$container_id" ] && container_id="$container"
             local inspect_json=$(crictl inspect "$container_id" 2>/dev/null)
             local mem=$(echo "$inspect_json" | grep -o '"memory": [^,]*' | head -1 | awk -F'[ :]' '{print $3}' | tr -d ',' || echo "0")
             local cpu=$(echo "$inspect_json" | grep -o '"cpu_quota": [^,]*' | head -1 | awk -F'[ :]' '{print $3}' | tr -d ',' || echo "0")
+            local cpu_period=$(echo "$inspect_json" | grep -o '"cpu_period": [^,]*' | head -1 | awk -F'[ :]' '{print $3}' | tr -d ',' || echo "0")
             local net=$(echo "$inspect_json" | grep -o '"network_mode": "[^"]*"' | head -1 | cut -d'"' -f4 || echo "default")
             local ro=$(echo "$inspect_json" | grep -o '"readonly_rootfs": [^,]*' | head -1 | awk '{print $2}' || echo "false")
+            local pid_limit="0"
         fi
 
-        log_info "容器 [$container] 内存限制: ${mem:-0} bytes"
-        [ "$mem" == "0" ] && log_warning "容器 [$container] 未设置内存限制" || log_success "容器 [$container] 已设置内存限制"
+        # 内存限制
+        if [ "$mem" == "0" ] || [ -z "$mem" ]; then
+            log_warning "容器 [$container] 未设置内存限制"
+            log_detail "风险: 可能导致资源耗尽攻击"
+            log_detail "建议: 使用 --memory 参数限制内存使用"
+        else
+            local mem_mb=$((mem / 1024 / 1024))
+            log_success "容器 [$container] 内存限制: ${mem_mb}MB"
+        fi
 
-        log_info "容器 [$container] CPU限制: ${cpu:-0}"
-        [ "$cpu" == "0" ] && log_warning "容器 [$container] 未设置CPU限制" || log_success "容器 [$container] 已设置CPU限制"
+        # CPU限制
+        if [ "$cpu" == "0" ] || [ -z "$cpu" ]; then
+            log_warning "容器 [$container] 未设置CPU限制"
+            log_detail "风险: 可能占用过多CPU资源"
+        else
+            local cpu_cores=$(echo "scale=2; $cpu / 100000" | bc 2>/dev/null || echo "$cpu")
+            log_success "容器 [$container] CPU限制: quota=$cpu, period=${cpu_period:-100000}"
+        fi
 
-        log_info "容器 [$container] 网络模式: ${net:-default}"
-        [ "$net" == "host" ] && log_error "容器 [$container] 使用host网络模式" || log_success "容器 [$container] 网络模式: $net"
+        # 网络模式
+        log_result "网络模式: $net"
+        if [ "$net" == "host" ]; then
+            log_error "容器 [$container] 使用host网络模式"
+            log_detail "风险: 容器可以直接访问宿主机网络，端口无隔离"
+            log_detail "建议: 使用bridge或自定义网络"
+        else
+            log_success "容器 [$container] 网络模式安全: $net"
+        fi
 
-        [ "$ro" == "true" ] && log_success "容器 [$container] 根文件系统为只读" || log_warning "容器 [$container] 根文件系统可写"
+        # 只读根文件系统
+        log_result "只读根文件系统: $ro"
+        if [ "$ro" == "true" ]; then
+            log_success "容器 [$container] 根文件系统为只读"
+        else
+            log_warning "容器 [$container] 根文件系统可写"
+            log_detail "建议: 使用 --read-only 参数保护根文件系统"
+        fi
+
+        # PID限制
+        if [ "$pid_limit" != "0" ] && [ -n "$pid_limit" ]; then
+            log_success "容器 [$container] PID限制: $pid_limit"
+        else
+            log_warning "容器 [$container] 未设置PID限制"
+        fi
+
+        # ===== Capabilities检查 =====
+        echo ""
+        log_cmd "docker inspect --format '{{.HostConfig.CapAdd}}'" "检查Linux Capabilities"
+
+        if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+            local cap_add=$(docker inspect "$container" --format '{{.HostConfig.CapAdd}}' 2>/dev/null || true)
+            local cap_drop=$(docker inspect "$container" --format '{{.HostConfig.CapDrop}}' 2>/dev/null || true)
+        fi
+
+        if [ -n "$cap_add" ] && [ "$cap_add" != "[]" ]; then
+            log_warning "容器 [$container] 添加了额外Capabilities: $cap_add"
+            log_detail "风险: 额外的capabilities可能被利用进行攻击"
+
+            # 检查危险capabilities
+            local dangerous_caps="SYS_ADMIN NET_ADMIN SYS_PTRACE SYS_MODULE DAC_READ_SEARCH"
+            for cap in $dangerous_caps; do
+                if echo "$cap_add" | grep -qi "$cap"; then
+                    log_error "发现危险Capability: $cap"
+                fi
+            done
+        else
+            log_success "容器 [$container] 未添加额外Capabilities"
+        fi
+
+        if [ -n "$cap_drop" ] && [ "$cap_drop" != "[]" ]; then
+            log_success "容器 [$container] 已丢弃Capabilities: $cap_drop"
+        fi
     done
 }
 
@@ -839,8 +1033,41 @@ check_image_security() {
     log_info "开始检查镜像安全..."
 
     for container in $CONTAINERS; do
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
+        log_cmd "docker inspect --format '{{.Config.Image}}'" "获取镜像信息"
         local image=$(container_inspect "$container" --format '{{.Config.Image}}' 2>/dev/null || true)
-        echo "$image" | grep -qE ":latest$|:$" && log_warning "容器 [$container] 使用latest标签镜像: $image"
+        log_result "镜像: $image"
+
+        # 检查镜像标签
+        if echo "$image" | grep -qE ":latest$|:$"; then
+            log_warning "容器 [$container] 使用latest标签镜像"
+            log_detail "风险: latest标签可能指向不同版本，难以追踪漏洞"
+            log_detail "建议: 使用明确的版本标签如 nginx:1.24"
+        else
+            log_success "容器 [$container] 使用明确版本标签"
+        fi
+
+        # 获取镜像创建时间
+        if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+            local image_id=$(docker inspect "$container" --format '{{.Image}}' 2>/dev/null || true)
+            local created=$(docker inspect "$image_id" --format '{{.Created}}' 2>/dev/null || true)
+            log_detail "镜像创建时间: $created"
+        fi
+
+        # 检查镜像大小
+        if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+            local image_size=$(docker inspect "$container" --format '{{.Size}}' 2>/dev/null || echo "0")
+            if [ "$image_size" != "0" ]; then
+                local size_mb=$((image_size / 1024 / 1024))
+                log_detail "镜像大小: ${size_mb}MB"
+
+                if [ "$size_mb" -gt "500" ]; then
+                    log_warning "镜像较大 (${size_mb}MB)，可能包含不必要的软件"
+                fi
+            fi
+        fi
     done
 }
 
@@ -851,10 +1078,28 @@ check_md5_password_security() {
     log_info "开始检查MD5密码..."
 
     for container in $CONTAINERS; do
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
+        log_cmd "grep -E '\\\$1\\\$' /etc/shadow" "检查MD5加密密码"
         local md5=$(container_exec "$container" "grep -E '\\\$1\\\$' /etc/shadow 2>/dev/null" || true)
+
         if [ -n "$md5" ]; then
+            local md5_count=$(echo "$md5" | wc -l)
             log_error "容器 [$container] 使用MD5加密密码"
-            echo "  发现行数: $(echo "$md5" | wc -l)" >> "$REPORT_FILE"
+            log_result "发现 $md5_count 个MD5加密的密码"
+
+            echo "  \`\`\`" >> "$REPORT_FILE"
+            echo "$md5" | while read line; do
+                # 隐藏密码哈希
+                local masked=$(echo "$line" | sed 's/\$1\$[^:]*:/**MD5_HASH**:/')
+                log_detail "$masked"
+                echo "    $masked" >> "$REPORT_FILE"
+            done
+            echo "  \`\`\`" >> "$REPORT_FILE"
+
+            log_detail "风险: MD5加密已被破解，建议使用SHA-512"
+            log_detail "建议: 修改 /etc/login.defs 中的 ENCRYPT_METHOD 为 SHA512"
         else
             log_success "容器 [$container] 未使用MD5加密密码"
         fi
@@ -867,19 +1112,37 @@ check_residual_tools() {
     echo "## 10. 安全残留工具检查 (D_SCS_5_4)" >> "$REPORT_FILE"
     log_info "开始检查容器内安全工具..."
 
-    local tools="gcc g++ make nmap netcat tcpdump gdb john hydra curl wget"
+    local tools="gcc g++ make nmap netcat tcpdump gdb john hydra curl wget nc"
 
     for container in $CONTAINERS; do
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
         log_info "检查容器 [$container] 安全工具..."
+
         local found_tools=""
+        local tool_details=""
+
         for tool in $tools; do
+            log_cmd "which $tool" "检查工具 $tool"
             local tool_path=$(container_exec "$container" "which $tool 2>/dev/null" || true)
+
             if [ -n "$tool_path" ]; then
-                found_tools="$found_tools $tool($tool_path)"
+                found_tools="$found_tools $tool"
+                log_result "发现: $tool ($tool_path)"
+
+                # 获取工具版本信息
+                local version=$(container_exec "$container" "$tool --version 2>/dev/null | head -1" || true)
+                [ -n "$version" ] && log_detail "版本: $version"
+                tool_details="$tool_details\n  - $tool: $tool_path"
             fi
         done
+
         if [ -n "$found_tools" ]; then
             log_warning "容器 [$container] 包含安全工具:$found_tools"
+            log_detail "风险: 安全工具可能被攻击者利用"
+            log_detail "建议: 在生产镜像中移除这些工具"
+            echo -e "$tool_details" >> "$REPORT_FILE"
         else
             log_success "容器 [$container] 未发现高危安全工具"
         fi
@@ -893,16 +1156,33 @@ check_debug_tools() {
     log_info "开始检查容器内调试工具..."
 
     for container in $CONTAINERS; do
-        log_info "扫描容器 [$container] 调试工具..."
-        local debug_tools=$(container_exec "$container" "find / -type f \( -name 'tcpdump' -o -name 'gdb' -o -name 'strace' -o -name 'nmap' -o -name 'wireshark' -o -name 'gcc' -o -name 'g++' -o -name 'make' -o -name 'cmake' -o -name 'perf' \) 2>/dev/null | head -20" || true)
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
+        log_cmd "find / -type f \\( -name 'tcpdump' -o -name 'gdb' -o -name 'strace' ... \\)" "扫描调试工具"
+
+        local debug_tools=$(container_exec "$container" "find / -type f \( -name 'tcpdump' -o -name 'gdb' -o -name 'strace' -o -name 'nmap' -o -name 'wireshark' -o -name 'gcc' -o -name 'g++' -o -name 'make' -o -name 'cmake' -o -name 'perf' -o -name 'objdump' -o -name 'readelf' \) 2>/dev/null | head -30" || true)
 
         if [ -n "$debug_tools" ]; then
             local count=$(echo "$debug_tools" | wc -l)
             log_warning "容器 [$container] 发现 $count 个调试工具"
-            echo "  发现的工具:" >> "$REPORT_FILE"
+
+            echo -e "  ${CYAN}→ 发现的工具:${NC}"
             echo "  \`\`\`" >> "$REPORT_FILE"
-            echo "$debug_tools" >> "$REPORT_FILE"
+            echo "$debug_tools" | while read tool; do
+                if [ -n "$tool" ]; then
+                    echo -e "    ${CYAN}$tool${NC}"
+                    echo "    $tool" >> "$REPORT_FILE"
+
+                    # 检查工具权限
+                    local perms=$(container_exec "$container" "stat -c '%a %U:%G' '$tool' 2>/dev/null" || true)
+                    [ -n "$perms" ] && log_detail "权限: $perms"
+                fi
+            done
             echo "  \`\`\`" >> "$REPORT_FILE"
+
+            log_detail "风险: 调试工具可能被用于逆向分析或漏洞利用"
+            log_detail "建议: 移除开发工具或使用最小化镜像"
         else
             log_success "容器 [$container] 未发现调试工具"
         fi
@@ -916,21 +1196,67 @@ check_user_permissions() {
     log_info "开始检查容器内用户权限..."
 
     for container in $CONTAINERS; do
-        # UID为0的账户
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
+        # ===== UID为0的账户检查 =====
+        log_cmd "awk -F: '\$3 == 0 {print \$1}' /etc/passwd" "检查UID为0的账户"
         local uid0=$(container_exec "$container" "awk -F: '\$3 == 0 {print \$1}' /etc/passwd 2>/dev/null" || true)
+        log_result "UID=0账户: ${uid0:-root}"
+
         if [ -n "$uid0" ] && [ "$uid0" != "root" ]; then
-            log_warning "容器 [$container] 发现多个UID为0账户: $uid0"
+            log_error "容器 [$container] 发现多个UID为0账户: $uid0"
+            log_detail "风险: 多个UID为0的账户可能导致权限管理混乱"
         else
             log_success "容器 [$container] 仅root账户UID为0"
         fi
 
-        # 口令期限
+        # ===== 口令期限检查 =====
+        echo ""
+        log_cmd "grep '^PASS_MAX_DAYS' /etc/login.defs" "检查口令期限配置"
         local maxdays=$(container_exec "$container" "grep '^PASS_MAX_DAYS' /etc/login.defs 2>/dev/null | awk '{print \$2}'" || true)
+
         if [ -n "$maxdays" ]; then
-            log_info "容器 [$container] 口令期限: $maxdays 天"
-            [ "$maxdays" -gt "90" ] 2>/dev/null && log_warning "容器 [$container] 口令期限过长: $maxdays 天" || log_success "容器 [$container] 口令期限符合规范"
+            log_result "口令最大有效期: $maxdays 天"
+
+            if [ "$maxdays" -gt "90" ] 2>/dev/null; then
+                log_warning "容器 [$container] 口令期限过长: $maxdays 天"
+                log_detail "建议: 设置 PASS_MAX_DAYS <= 90"
+            else
+                log_success "容器 [$container] 口令期限符合规范"
+            fi
         else
-            log_info "容器 [$container] 无法获取口令期限配置"
+            log_info "容器 [$container] 无法获取口令期限配置(可能无login.defs)"
+        fi
+
+        # ===== 空密码账户检查 =====
+        echo ""
+        log_cmd "awk -F: '\$2 == \"\" {print \$1}' /etc/shadow" "检查空密码账户"
+        local empty_pass=$(container_exec "$container" "awk -F: '\$2 == \"\" {print \$1}' /etc/shadow 2>/dev/null" || true)
+
+        if [ -n "$empty_pass" ]; then
+            log_error "容器 [$container] 发现空密码账户: $empty_pass"
+            log_detail "风险: 空密码账户可被无密码登录"
+        else
+            log_success "容器 [$container] 未发现空密码账户"
+        fi
+
+        # ===== sudo权限检查 =====
+        echo ""
+        log_cmd "which sudo && cat /etc/sudoers" "检查sudo配置"
+        local sudo_installed=$(container_exec "$container" "which sudo 2>/dev/null" || true)
+
+        if [ -n "$sudo_installed" ]; then
+            log_warning "容器 [$container] 安装了sudo"
+
+            # 检查NOPASSWD配置
+            local nopasswd=$(container_exec "$container" "grep -r 'NOPASSWD' /etc/sudoers /etc/sudoers.d 2>/dev/null" || true)
+            if [ -n "$nopasswd" ]; then
+                log_error "容器 [$container] 存在NOPASSWD配置"
+                log_detail "$nopasswd"
+            fi
+        else
+            log_success "容器 [$container] 未安装sudo"
         fi
     done
 }
@@ -942,27 +1268,107 @@ check_file_permissions() {
     log_info "开始检查容器内文件权限..."
 
     for container in $CONTAINERS; do
-        # 敏感文件权限
-        local shadow_perm=$(container_exec "$container" "stat -c '%a' /etc/shadow 2>/dev/null" || true)
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
+        # ===== 敏感文件权限检查 =====
+        log_info "=== 敏感文件权限检查 ==="
+
+        # /etc/shadow 权限
+        log_cmd "stat -c '%a %U:%G' /etc/shadow" "检查shadow文件权限"
+        local shadow_perm=$(container_exec "$container" "stat -c '%a %U:%G' /etc/shadow 2>/dev/null" || true)
+
         if [ -n "$shadow_perm" ]; then
-            log_info "容器 [$container] /etc/shadow 权限: $shadow_perm"
-            [ "$shadow_perm" -le "640" ] 2>/dev/null && log_success "容器 [$container] shadow文件权限安全" || log_warning "容器 [$container] shadow文件权限过宽"
+            log_result "/etc/shadow: $shadow_perm"
+            local perm_num=$(echo "$shadow_perm" | awk '{print $1}')
+
+            if [ "$perm_num" -le "640" ] 2>/dev/null; then
+                log_success "容器 [$container] shadow文件权限安全"
+            else
+                log_warning "容器 [$container] shadow文件权限过宽: $perm_num"
+                log_detail "建议: chmod 640 /etc/shadow"
+            fi
         else
-            log_info "容器 [$container] 无法获取shadow权限"
+            log_info "容器 [$container] 无法获取shadow权限(可能不存在)"
         fi
 
-        # passwd文件权限
-        local passwd_perm=$(container_exec "$container" "stat -c '%a' /etc/passwd 2>/dev/null" || true)
+        # /etc/passwd 权限
+        log_cmd "stat -c '%a %U:%G' /etc/passwd" "检查passwd文件权限"
+        local passwd_perm=$(container_exec "$container" "stat -c '%a %U:%G' /etc/passwd 2>/dev/null" || true)
+
         if [ -n "$passwd_perm" ]; then
-            log_info "容器 [$container] /etc/passwd 权限: $passwd_perm"
+            log_result "/etc/passwd: $passwd_perm"
         fi
 
-        # 无属主文件
-        local noowner=$(container_exec "$container" "find /etc -nouser -o -nogroup 2>/dev/null | head -3" || true)
+        # /etc/gshadow 权限
+        log_cmd "stat -c '%a %U:%G' /etc/gshadow" "检查gshadow文件权限"
+        local gshadow_perm=$(container_exec "$container" "stat -c '%a %U:%G' /etc/gshadow 2>/dev/null" || true)
+
+        if [ -n "$gshadow_perm" ]; then
+            log_result "/etc/gshadow: $gshadow_perm"
+        fi
+
+        # ===== SUID/SGID文件检查 =====
+        echo ""
+        log_info "=== SUID/SGID文件检查 ==="
+        log_cmd "find / -perm -4000 -o -perm -2000 2>/dev/null | head -20" "查找SUID/SGID文件"
+
+        local suid_files=$(container_exec "$container" "find / -perm -4000 -type f 2>/dev/null | head -20" || true)
+
+        if [ -n "$suid_files" ]; then
+            local suid_count=$(echo "$suid_files" | wc -l)
+            log_warning "容器 [$container] 发现 $suid_count 个SUID文件"
+
+            echo "  \`\`\`" >> "$REPORT_FILE"
+            echo "$suid_files" | while read file; do
+                if [ -n "$file" ]; then
+                    echo -e "    ${CYAN}$file${NC}"
+                    echo "    $file" >> "$REPORT_FILE"
+
+                    # 检查是否为常见的SUID程序
+                    local basename=$(basename "$file")
+                    local common_suid="sudo passwd su mount umount ping newgrp chsh chfn"
+                    if ! echo "$common_suid" | grep -qw "$basename"; then
+                        log_detail "非标准SUID程序: $basename"
+                    fi
+                fi
+            done
+            echo "  \`\`\`" >> "$REPORT_FILE"
+
+            log_detail "风险: SUID程序可能被用于权限提升"
+        else
+            log_success "容器 [$container] 未发现SUID文件"
+        fi
+
+        # ===== 无属主文件检查 =====
+        echo ""
+        log_info "=== 无属主文件检查 ==="
+        log_cmd "find / -nouser -o -nogroup 2>/dev/null | head -10" "查找无属主文件"
+
+        local noowner=$(container_exec "$container" "find /etc /opt /app -nouser -o -nogroup 2>/dev/null | head -10" || true)
+
         if [ -n "$noowner" ]; then
-            log_warning "容器 [$container] 发现无属主文件"
+            log_warning "容器 [$container] 发现无属主文件:"
+            echo "$noowner" | while read file; do
+                [ -n "$file" ] && log_detail "$file"
+            done
+            log_detail "风险: 无属主文件可能被攻击者利用"
         else
             log_success "容器 [$container] 未发现无属主文件"
+        fi
+
+        # ===== 可写文件检查 =====
+        echo ""
+        log_cmd "find /etc -type f -perm /002 2>/dev/null | head -10" "查找其他用户可写文件"
+        local writable=$(container_exec "$container" "find /etc -type f -perm /002 2>/dev/null | head -10" || true)
+
+        if [ -n "$writable" ]; then
+            log_warning "容器 [$container] /etc目录下发现其他用户可写文件:"
+            echo "$writable" | while read file; do
+                [ -n "$file" ] && log_detail "$file"
+            done
+        else
+            log_success "容器 [$container] /etc目录下文件权限安全"
         fi
     done
 }
@@ -974,11 +1380,38 @@ check_brute_force_protection() {
     log_info "开始检查容器内暴力破解防护..."
 
     for container in $CONTAINERS; do
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
+        log_cmd "which fail2ban-server" "检查fail2ban安装"
         local fail2ban=$(container_exec "$container" "which fail2ban-server 2>/dev/null" || true)
+
         if [ -n "$fail2ban" ]; then
             log_success "容器 [$container] 已安装fail2ban: $fail2ban"
+
+            # 检查fail2ban状态
+            log_cmd "fail2ban-client status" "检查fail2ban状态"
+            local f2b_status=$(container_exec "$container" "fail2ban-client status 2>/dev/null" || true)
+            if [ -n "$f2b_status" ]; then
+                log_result "fail2ban状态: 运行中"
+                log_detail "$f2b_status"
+            fi
         else
             log_warning "容器 [$container] 未安装fail2ban"
+            log_detail "注意: 容器环境通常不需要fail2ban"
+            log_detail "建议: 如果暴露SSH服务，考虑安装fail2ban"
+        fi
+
+        # 检查登录失败锁定策略
+        echo ""
+        log_cmd "grep 'auth required' /etc/pam.d/* 2>/dev/null | grep deny" "检查PAM锁定策略"
+        local pam_lock=$(container_exec "$container" "grep -r 'auth required' /etc/pam.d/ 2>/dev/null | grep -E 'deny|lock'" || true)
+
+        if [ -n "$pam_lock" ]; then
+            log_success "容器 [$container] 配置了登录失败锁定策略"
+            log_detail "$pam_lock"
+        else
+            log_info "容器 [$container] 未配置登录失败锁定策略"
         fi
     done
 }
@@ -989,27 +1422,50 @@ check_unsafe_functions() {
     echo "## 15. 不安全函数检查 (RL_13_1_2_1)" >> "$REPORT_FILE"
     log_info "开始检查代码中不安全函数..."
 
-    local unsafe_funcs="strcpy strcat sprintf gets scanf"
+    local unsafe_funcs="strcpy strcat sprintf gets scanf sscanf vsprintf strtok"
 
     for container in $CONTAINERS; do
-        log_info "扫描容器 [$container] C代码文件..."
-        local cfiles=$(container_exec "$container" "find /app /home /root -name '*.c' 2>/dev/null | head -10" || true)
+        echo "" >> "$REPORT_FILE"
+        echo "### 容器: $container" >> "$REPORT_FILE"
+
+        log_cmd "find /app /home /root -name '*.c' -o -name '*.cpp' 2>/dev/null" "查找C/C++代码文件"
+        local cfiles=$(container_exec "$container" "find /app /home /root -type f \( -name '*.c' -o -name '*.cpp' \) 2>/dev/null | head -20" || true)
+
         if [ -z "$cfiles" ]; then
-            log_info "容器 [$container] 未发现C代码文件"
+            log_info "容器 [$container] 未发现C/C++代码文件"
             continue
         fi
 
+        local file_count=$(echo "$cfiles" | wc -l)
+        log_result "发现 $file_count 个C/C++文件"
+
         local found_unsafe=false
+        local unsafe_count=0
+
         for file in $cfiles; do
             for func in $unsafe_funcs; do
+                log_cmd "grep -l '$func' $file" "检查函数 $func"
                 local match=$(container_exec "$container" "grep -l '$func' '$file' 2>/dev/null" || true)
+
                 if [ -n "$match" ]; then
                     log_warning "容器 [$container] 发现不安全函数 $func: $file"
                     found_unsafe=true
+                    unsafe_count=$((unsafe_count + 1))
+
+                    # 显示使用位置
+                    local usage=$(container_exec "$container" "grep -n '$func' '$file' 2>/dev/null | head -3" || true)
+                    [ -n "$usage" ] && log_detail "$usage"
                 fi
             done
         done
-        [ "$found_unsafe" = false ] && log_success "容器 [$container] 未发现不安全函数"
+
+        if [ "$found_unsafe" = false ]; then
+            log_success "容器 [$container] 未发现不安全函数"
+        else
+            log_warning "容器 [$container] 共发现 $unsafe_count 处不安全函数调用"
+            log_detail "风险: 不安全函数可能导致缓冲区溢出"
+            log_detail "建议: 使用安全的替代函数如strncpy、snprintf"
+        fi
     done
 }
 
@@ -1047,7 +1503,7 @@ main() {
 
     echo -e "${BLUE}"
     echo "========================================"
-    echo "    容器安全扫描工具 v2.3"
+    echo "    容器安全扫描工具 v2.4"
     echo "========================================"
     echo -e "${NC}"
 
