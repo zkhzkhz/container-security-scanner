@@ -1,7 +1,8 @@
 #!/bin/bash
-# 容器安全扫描工具 v2.2
+# 容器安全扫描工具 v2.3
 # 基于安全规范要求的多项安全检查
 # 默认只扫描容器环境，支持指定特定容器
+# 支持Docker和crictl(containerd/CRI)两种容器运行时
 
 set -o pipefail
 
@@ -17,6 +18,9 @@ SCAN_MODE="${SCAN_MODE:-container}"
 
 # 指定扫描的容器名称
 TARGET_CONTAINERS=""
+
+# 容器运行时 (auto/docker/crictl)
+CONTAINER_RUNTIME=""
 
 # 输出目录
 REPORT_DIR="/tmp/container_security_scan_$(date +%Y%m%d_%H%M%S)"
@@ -35,9 +39,13 @@ LOW_ISSUES=0
 # 容器列表(全局变量)
 CONTAINERS=""
 
+# 容器ID到名称的映射
+declare -A CONTAINER_ID_TO_NAME
+declare -A CONTAINER_NAME_TO_ID
+
 # 显示帮助信息
 show_help() {
-    echo -e "${BLUE}容器安全扫描工具 v2.2${NC}"
+    echo -e "${BLUE}容器安全扫描工具 v2.3${NC}"
     echo ""
     echo "用法: $0 [选项] [容器名称...]"
     echo ""
@@ -45,20 +53,99 @@ show_help() {
     echo "  -h, --help          显示帮助信息"
     echo "  -a, --all           扫描所有运行中的容器(默认)"
     echo "  -l, --list          列出所有运行中的容器"
+    echo "  -r, --runtime       指定容器运行时: auto(默认)/docker/crictl"
     echo "  -m, --mode MODE     设置扫描模式: container(默认)/host/all"
     echo ""
     echo "示例:"
     echo "  $0                        # 扫描所有容器"
     echo "  $0 nginx mysql            # 仅扫描nginx和mysql容器"
-    echo "  $0 haproxy                # 仅扫描haproxy容器"
+    echo "  $0 -r crictl              # 使用crictl运行时扫描"
     echo "  $0 -l                     # 列出所有容器"
     exit 0
 }
 
+# 检测容器运行时
+detect_runtime() {
+    if [ -n "$CONTAINER_RUNTIME" ] && [ "$CONTAINER_RUNTIME" != "auto" ]; then
+        return
+    fi
+
+    # 优先检测docker
+    if command -v docker &>/dev/null && docker ps &>/dev/null 2>&1; then
+        CONTAINER_RUNTIME="docker"
+        return
+    fi
+
+    # 检测crictl
+    if command -v crictl &>/dev/null && crictl ps &>/dev/null 2>&1; then
+        CONTAINER_RUNTIME="crictl"
+        return
+    fi
+
+    # 默认docker
+    CONTAINER_RUNTIME="docker"
+}
+
+# 获取容器执行命令 (docker exec 或 nsenter)
+container_exec() {
+    local container="$1"
+    shift
+    local cmd="$@"
+
+    if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+        container_exec "$container" sh -c "$cmd"
+    elif [ "$CONTAINER_RUNTIME" = "crictl" ]; then
+        local container_id="${CONTAINER_NAME_TO_ID[$container]}"
+        if [ -z "$container_id" ]; then
+            container_id="$container"
+        fi
+        # 使用crictl exec
+        crictl exec "$container_id" sh -c "$cmd" 2>/dev/null || \
+        # 或者使用nsenter
+        nsenter -t $(crictl inspect "$container_id" | grep -o '"pid": [0-9]*' | awk '{print $2}') -- sh -c "$cmd" 2>/dev/null
+    fi
+}
+
+# 获取容器inspect信息
+container_inspect() {
+    local container="$1"
+    local format="$2"
+
+    if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+        docker inspect "$container" --format "$format" 2>/dev/null
+    elif [ "$CONTAINER_RUNTIME" = "crictl" ]; then
+        local container_id="${CONTAINER_NAME_TO_ID[$container]}"
+        [ -z "$container_id" ] && container_id="$container"
+        crictl inspect "$container_id" 2>/dev/null | jq -r "$format" 2>/dev/null || \
+        echo ""
+    fi
+}
+
+# 获取容器端口映射
+container_port() {
+    local container="$1"
+
+    if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+        container_port "$container" 2>/dev/null
+    elif [ "$CONTAINER_RUNTIME" = "crictl" ]; then
+        local container_id="${CONTAINER_NAME_TO_ID[$container]}"
+        [ -z "$container_id" ] && container_id="$container"
+        crictl inspect "$container_id" 2>/dev/null | jq -r '.status.portMappings // [] | .[] | "\(.containerPort)/\(.protocol) -> \(.hostIp):\(.hostPort)"' 2>/dev/null || \
+        echo ""
+    fi
+}
+
 # 列出所有运行中的容器
 list_containers() {
-    echo -e "${BLUE}运行中的容器列表:${NC}"
-    docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null
+    detect_runtime
+    echo -e "${BLUE}运行中的容器列表 (运行时: $CONTAINER_RUNTIME):${NC}"
+
+    if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+        docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null
+    elif [ "$CONTAINER_RUNTIME" = "crictl" ]; then
+        crictl ps --format "table {{.Name}}\t{{.Image}}\t{{.Status}}" 2>/dev/null || \
+        crictl ps 2>/dev/null | awk '{print $1"\t"$2"\t"$7}'
+    fi
     exit 0
 }
 
@@ -69,6 +156,9 @@ parse_args() {
             -h|--help) show_help ;;
             -a|--all) TARGET_CONTAINERS=""; shift ;;
             -l|--list) list_containers ;;
+            -r|--runtime)
+                [ -n "$2" ] && CONTAINER_RUNTIME="$2" && shift 2 || { echo -e "${RED}错误: --runtime 需要参数${NC}"; exit 1; }
+                ;;
             -m|--mode)
                 [ -n "$2" ] && SCAN_MODE="$2" && shift 2 || { echo -e "${RED}错误: --mode 需要参数${NC}"; exit 1; }
                 ;;
@@ -84,11 +174,36 @@ parse_args() {
 
 # 初始化容器列表
 init_containers() {
-    if [ -z "$TARGET_CONTAINERS" ]; then
-        CONTAINERS=$(docker ps --format "{{.Names}}" 2>/dev/null)
-    else
-        for name in $TARGET_CONTAINERS; do
-            if docker ps --format "{{.Names}}" 2>/dev/null | grep -qx "$name"; then
+    detect_runtime
+
+    log_info "检测到容器运行时: $CONTAINER_RUNTIME"
+
+    if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+        if [ -z "$TARGET_CONTAINERS" ]; then
+            CONTAINERS=$(docker ps --format "{{.Names}}" 2>/dev/null)
+        else
+            for name in $TARGET_CONTAINERS; do
+                if docker ps --format "{{.Names}}" 2>/dev/null | grep -qx "$name"; then
+                    CONTAINERS="${CONTAINERS:+$CONTAINERS }$name"
+                else
+                    echo -e "${YELLOW}[警告] 容器 '$name' 不存在或未运行，已跳过${NC}"
+                fi
+            done
+        fi
+    elif [ "$CONTAINER_RUNTIME" = "crictl" ]; then
+        # 使用crictl获取容器列表
+        local container_list=""
+        if [ -z "$TARGET_CONTAINERS" ]; then
+            container_list=$(crictl ps --format "{{.Name}}" 2>/dev/null || crictl ps 2>/dev/null | awk 'NR>1 {print $NF}')
+        else
+            container_list="$TARGET_CONTAINERS"
+        fi
+
+        for name in $container_list; do
+            local container_id=$(crictl ps --name "$name" --format "{{.ID}}" 2>/dev/null | head -1)
+            if [ -n "$container_id" ]; then
+                CONTAINER_ID_TO_NAME["$container_id"]="$name"
+                CONTAINER_NAME_TO_ID["$name"]="$container_id"
                 CONTAINERS="${CONTAINERS:+$CONTAINERS }$name"
             else
                 echo -e "${YELLOW}[警告] 容器 '$name' 不存在或未运行，已跳过${NC}"
@@ -98,6 +213,7 @@ init_containers() {
 
     if [ -z "$CONTAINERS" ]; then
         echo -e "${RED}错误: 没有找到要扫描的容器${NC}"
+        echo -e "${YELLOW}提示: 使用 -r crictl 指定容器运行时${NC}"
         exit 1
     fi
 }
@@ -125,7 +241,7 @@ check_zero_ip_exposure() {
     log_info "开始检查容器内的 0.0.0.0 绑定..."
 
     for container in $CONTAINERS; do
-        local ports=$(docker port "$container" 2>/dev/null | grep "0.0.0.0" || true)
+        local ports=$(container_port "$container" 2>/dev/null | grep "0.0.0.0" || true)
         if [ -n "$ports" ]; then
             log_warning "容器 [$container] 绑定到 0.0.0.0"
             echo "  端口映射: $ports" >> "$REPORT_FILE"
@@ -140,7 +256,7 @@ check_ssl_certificates() {
     log_info "开始检查容器内证书..."
 
     for container in $CONTAINERS; do
-        local certs=$(docker exec "$container" find /etc -name "*.pem" -o -name "*.crt" 2>/dev/null | head -5 || true)
+        local certs=$(container_exec "$container" find /etc -name "*.pem" -o -name "*.crt" 2>/dev/null | head -5 || true)
         if [ -n "$certs" ]; then
             log_info "容器 [$container] 发现证书文件"
         fi
@@ -154,9 +270,9 @@ check_cipher_suites() {
     log_info "开始检查加密套件配置..."
 
     for container in $CONTAINERS; do
-        local nginx_check=$(docker exec "$container" which nginx 2>/dev/null || true)
+        local nginx_check=$(container_exec "$container" which nginx 2>/dev/null || true)
         if [ -n "$nginx_check" ]; then
-            local ssl_ciphers=$(docker exec "$container" sh -c "nginx -T 2>/dev/null | grep -i ssl_ciphers" 2>/dev/null || true)
+            local ssl_ciphers=$(container_exec "$container" sh -c "nginx -T 2>/dev/null | grep -i ssl_ciphers" 2>/dev/null || true)
             if [ -n "$ssl_ciphers" ]; then
                 for weak in RC4 DES 3DES MD5; do
                     echo "$ssl_ciphers" | grep -qi "$weak" && log_error "容器 [$container] 发现弱加密套件: $weak"
@@ -176,12 +292,12 @@ check_sensitive_info() {
 
     for container in $CONTAINERS; do
         for pattern in $patterns; do
-            local found=$(docker exec "$container" env 2>/dev/null | grep -i "$pattern" || true)
+            local found=$(container_exec "$container" env 2>/dev/null | grep -i "$pattern" || true)
             [ -n "$found" ] && log_warning "容器 [$container] 发现敏感环境变量: $pattern"
         done
 
         # SSH私钥检查
-        local keys=$(docker exec "$container" find / -name "id_rsa" 2>/dev/null | head -3 || true)
+        local keys=$(container_exec "$container" find / -name "id_rsa" 2>/dev/null | head -3 || true)
         [ -n "$keys" ] && log_warning "容器 [$container] 发现SSH私钥"
     done
 }
@@ -193,24 +309,24 @@ check_nginx_security() {
     log_info "开始检查Nginx安全规范..."
 
     for container in $CONTAINERS; do
-        local nginx_check=$(docker exec "$container" which nginx 2>/dev/null || true)
+        local nginx_check=$(container_exec "$container" which nginx 2>/dev/null || true)
         if [ -n "$nginx_check" ]; then
-            local config=$(docker exec "$container" sh -c "nginx -T 2>/dev/null" 2>/dev/null || true)
+            local config=$(container_exec "$container" sh -c "nginx -T 2>/dev/null" 2>/dev/null || true)
             echo "### 容器 [$container] Nginx配置检查" >> "$REPORT_FILE"
 
             # ========== 安装安全检查 ==========
             # 规范1: 删除缺省文件
             local default_files="/etc/nginx/conf.d/default.conf /usr/share/nginx/html/index.html"
             for f in $default_files; do
-                docker exec "$container" test -f "$f" 2>/dev/null && log_warning "容器 [$container] 存在缺省文件: $f (规范1)"
+                container_exec "$container" test -f "$f" 2>/dev/null && log_warning "容器 [$container] 存在缺省文件: $f (规范1)"
             done
 
             # 规范2: 检查模块数量(简化)
-            local module_count=$(docker exec "$container" nginx -V 2>&1 | grep -o "with-" | wc -l)
+            local module_count=$(container_exec "$container" nginx -V 2>&1 | grep -o "with-" | wc -l)
             log_info "容器 [$container] 编译模块数: $module_count (规范2)"
 
             # 规范3: 禁止webDAV
-            if docker exec "$container" nginx -V 2>&1 | grep -qi "http_dav_module"; then
+            if container_exec "$container" nginx -V 2>&1 | grep -qi "http_dav_module"; then
                 log_error "容器 [$container] 安装了webDAV模块 (规范3)"
             else
                 log_success "容器 [$container] 未安装webDAV模块 (规范3)"
@@ -248,7 +364,7 @@ check_nginx_security() {
                 log_success "容器 [$container] Nginx运行用户: $nginx_user (规范6)"
 
                 # 规范7: 账号锁定状态
-                local lock_status=$(docker exec "$container" passwd -S "$nginx_user" 2>/dev/null | awk '{print $2}')
+                local lock_status=$(container_exec "$container" passwd -S "$nginx_user" 2>/dev/null | awk '{print $2}')
                 if [ "$lock_status" == "L" ] || [ "$lock_status" == "LK" ]; then
                     log_success "容器 [$container] 账号 $nginx_user 已锁定 (规范7)"
                 else
@@ -256,7 +372,7 @@ check_nginx_security() {
                 fi
 
                 # 规范8: 禁止登录shell
-                local shell=$(docker exec "$container" getent passwd "$nginx_user" 2>/dev/null | cut -d: -f7)
+                local shell=$(container_exec "$container" getent passwd "$nginx_user" 2>/dev/null | cut -d: -f7)
                 if [ "$shell" == "/sbin/nologin" ] || [ "$shell" == "/bin/false" ] || [ -z "$shell" ]; then
                     log_success "容器 [$container] 账号 $nginx_user 禁止登录shell (规范8)"
                 else
@@ -266,9 +382,9 @@ check_nginx_security() {
 
             # ========== 文件权限检查 ==========
             # 规范9: Nginx目录权限
-            local nginx_dir=$(docker exec "$container" nginx -V 2>&1 | grep -o "prefix=[^ ]*" | cut -d= -f2 | tr -d ' ')
+            local nginx_dir=$(container_exec "$container" nginx -V 2>&1 | grep -o "prefix=[^ ]*" | cut -d= -f2 | tr -d ' ')
             [ -z "$nginx_dir" ] && nginx_dir="/etc/nginx"
-            local dir_perm=$(docker exec "$container" stat -c "%a" "$nginx_dir" 2>/dev/null || echo "755")
+            local dir_perm=$(container_exec "$container" stat -c "%a" "$nginx_dir" 2>/dev/null || echo "755")
             if [ "$dir_perm" -le "550" ]; then
                 log_success "容器 [$container] Nginx目录权限: $dir_perm (规范9)"
             else
@@ -276,7 +392,7 @@ check_nginx_security() {
             fi
 
             # 规范10: 配置文件权限
-            local conf_perm=$(docker exec "$container" stat -c "%a" /etc/nginx/nginx.conf 2>/dev/null || echo "644")
+            local conf_perm=$(container_exec "$container" stat -c "%a" /etc/nginx/nginx.conf 2>/dev/null || echo "644")
             if [ "$conf_perm" -le "640" ]; then
                 log_success "容器 [$container] 配置文件权限: $conf_perm (规范10)"
             else
@@ -287,7 +403,7 @@ check_nginx_security() {
             local log_dir="/var/log/nginx"
             local log_issue=false
             for logfile in access.log error.log; do
-                local log_perm=$(docker exec "$container" stat -c "%a" "$log_dir/$logfile" 2>/dev/null || echo "644")
+                local log_perm=$(container_exec "$container" stat -c "%a" "$log_dir/$logfile" 2>/dev/null || echo "644")
                 if [ "$log_perm" -gt "640" ]; then
                     log_error "容器 [$container] 日志文件权限过宽: $logfile ($log_perm) (规范11)"
                     log_issue=true
@@ -298,7 +414,7 @@ check_nginx_security() {
             # 规范13: PID文件权限
             local pid_file=$(echo "$config" | grep -E "^\s*pid\s+" | awk '{print $2}' | tr -d ';')
             [ -z "$pid_file" ] && pid_file="/var/run/nginx.pid"
-            local pid_perm=$(docker exec "$container" stat -c "%a" "$pid_file" 2>/dev/null || echo "644")
+            local pid_perm=$(container_exec "$container" stat -c "%a" "$pid_file" 2>/dev/null || echo "644")
             if [ "$pid_perm" -le "640" ]; then
                 log_success "容器 [$container] PID文件权限: $pid_perm (规范13)"
             else
@@ -553,7 +669,7 @@ check_ports() {
 
     echo "### 容器端口映射" >> "$REPORT_FILE"
     for container in $CONTAINERS; do
-        local ports=$(docker port "$container" 2>/dev/null || true)
+        local ports=$(container_port "$container" 2>/dev/null || true)
         echo "容器 [$container]:" >> "$REPORT_FILE"
         echo "$ports" >> "$REPORT_FILE"
     done
@@ -569,26 +685,26 @@ check_container_baseline() {
         echo "### 容器 [$container]" >> "$REPORT_FILE"
 
         # 运行用户
-        local user=$(docker exec "$container" whoami 2>/dev/null || echo "unknown")
+        local user=$(container_exec "$container" whoami 2>/dev/null || echo "unknown")
         [ "$user" == "root" ] && log_warning "容器 [$container] 以root用户运行 (D_IAM_48_1)" || log_success "容器 [$container] 以非root用户运行"
 
         # 特权模式
-        local priv=$(docker inspect "$container" --format '{{.HostConfig.Privileged}}' 2>/dev/null || echo "false")
+        local priv=$(container_inspect "$container" --format '{{.HostConfig.Privileged}}' 2>/dev/null || echo "false")
         [ "$priv" == "true" ] && log_error "容器 [$container] 运行在特权模式" || log_success "容器 [$container] 未运行在特权模式"
 
         # 资源限制
-        local mem=$(docker inspect "$container" --format '{{.HostConfig.Memory}}' 2>/dev/null || echo "0")
+        local mem=$(container_inspect "$container" --format '{{.HostConfig.Memory}}' 2>/dev/null || echo "0")
         [ "$mem" == "0" ] && log_warning "容器 [$container] 未设置内存限制" || log_success "容器 [$container] 已设置内存限制"
 
-        local cpu=$(docker inspect "$container" --format '{{.HostConfig.CpuQuota}}' 2>/dev/null || echo "0")
+        local cpu=$(container_inspect "$container" --format '{{.HostConfig.CpuQuota}}' 2>/dev/null || echo "0")
         [ "$cpu" == "0" ] && log_warning "容器 [$container] 未设置CPU限制" || log_success "容器 [$container] 已设置CPU限制"
 
         # 网络模式
-        local net=$(docker inspect "$container" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null || echo "default")
+        local net=$(container_inspect "$container" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null || echo "default")
         [ "$net" == "host" ] && log_error "容器 [$container] 使用host网络模式" || log_info "容器 [$container] 网络模式: $net"
 
         # 只读根文件系统
-        local ro=$(docker inspect "$container" --format '{{.HostConfig.ReadonlyRootfs}}' 2>/dev/null || echo "false")
+        local ro=$(container_inspect "$container" --format '{{.HostConfig.ReadonlyRootfs}}' 2>/dev/null || echo "false")
         [ "$ro" == "true" ] && log_success "容器 [$container] 根文件系统为只读" || log_warning "容器 [$container] 根文件系统可写"
     done
 }
@@ -600,7 +716,7 @@ check_image_security() {
     log_info "开始检查镜像安全..."
 
     for container in $CONTAINERS; do
-        local image=$(docker inspect "$container" --format '{{.Config.Image}}' 2>/dev/null || true)
+        local image=$(container_inspect "$container" --format '{{.Config.Image}}' 2>/dev/null || true)
         echo "$image" | grep -qE ":latest$|:$" && log_warning "容器 [$container] 使用latest标签镜像: $image"
     done
 }
@@ -612,7 +728,7 @@ check_md5_password_security() {
     log_info "开始检查MD5密码..."
 
     for container in $CONTAINERS; do
-        local md5=$(docker exec "$container" grep -E '\$1\$' /etc/shadow 2>/dev/null || true)
+        local md5=$(container_exec "$container" grep -E '\$1\$' /etc/shadow 2>/dev/null || true)
         [ -n "$md5" ] && log_error "容器 [$container] 使用MD5加密密码" || log_success "容器 [$container] 未使用MD5加密密码"
     done
 }
@@ -628,7 +744,7 @@ check_residual_tools() {
     for container in $CONTAINERS; do
         local found=0
         for tool in $tools; do
-            if docker exec "$container" which "$tool" 2>/dev/null; then
+            if container_exec "$container" which "$tool" 2>/dev/null; then
                 log_warning "容器 [$container] 包含安全工具: $tool"
                 found=1
             fi
@@ -644,7 +760,7 @@ check_debug_tools() {
     log_info "开始检查容器内调试工具..."
 
     for container in $CONTAINERS; do
-        local debug_tools=$(docker exec "$container" sh -c "find / -name 'tcpdump' -o -name 'sniffer' -o -name 'nmap' -o -name 'wireshark' -o -name 'netcat' -o -name 'gdb' -o -name 'strace' -o -name 'readelf' -o -name 'ethereal' -o -name 'cpp' -o -name 'gcc' -o -name 'dexdump' -o -name 'mirror' -o -name 'jdk' -o -name 'javac' -o -name 'go' -o -name 'dlv' -o -name 'ld' -o -name 'lex' -o -name 'rpcgen' -o -name 'php' -o -name 'binutils' -o -name 'flex' -o -name 'glibc' -o -name 'aplay' -o -name 'ar' -o -name 'arecord' -o -name 'atop' -o -name 'cmake' -o -name 'Dev-cpp' -o -name 'iftop' -o -name 'jsoncpp' -o -name 'make' -o -name 'mcpp' -o -name 'nc' -o -name 'ncat' -o -name 'nload' -o -name 'objdump' -o -name 'perf' -o -name 'rpm-build' -o -name 'vnstat' -o -name 'vnstatsvg' -o -name 'telnetd' -o -name 'libtool' -o -name 'sdk' -o -name 'npm' -o -name 'npx' -o -name 'node-inspector' -o -name 'corepack' -o -name 'pdb.py' -o -name 'bdb.py' -o -name 'trace.py' -o -name 'tracemalloc.py' -o -name 'timeit.py' 2>/dev/null | sort" 2>/dev/null || true)
+        local debug_tools=$(container_exec "$container" sh -c "find / -name 'tcpdump' -o -name 'sniffer' -o -name 'nmap' -o -name 'wireshark' -o -name 'netcat' -o -name 'gdb' -o -name 'strace' -o -name 'readelf' -o -name 'ethereal' -o -name 'cpp' -o -name 'gcc' -o -name 'dexdump' -o -name 'mirror' -o -name 'jdk' -o -name 'javac' -o -name 'go' -o -name 'dlv' -o -name 'ld' -o -name 'lex' -o -name 'rpcgen' -o -name 'php' -o -name 'binutils' -o -name 'flex' -o -name 'glibc' -o -name 'aplay' -o -name 'ar' -o -name 'arecord' -o -name 'atop' -o -name 'cmake' -o -name 'Dev-cpp' -o -name 'iftop' -o -name 'jsoncpp' -o -name 'make' -o -name 'mcpp' -o -name 'nc' -o -name 'ncat' -o -name 'nload' -o -name 'objdump' -o -name 'perf' -o -name 'rpm-build' -o -name 'vnstat' -o -name 'vnstatsvg' -o -name 'telnetd' -o -name 'libtool' -o -name 'sdk' -o -name 'npm' -o -name 'npx' -o -name 'node-inspector' -o -name 'corepack' -o -name 'pdb.py' -o -name 'bdb.py' -o -name 'trace.py' -o -name 'tracemalloc.py' -o -name 'timeit.py' 2>/dev/null | sort" 2>/dev/null || true)
 
         if [ -n "$debug_tools" ]; then
             log_warning "容器 [$container] 发现调试工具"
@@ -666,11 +782,11 @@ check_user_permissions() {
 
     for container in $CONTAINERS; do
         # UID为0的账户
-        local uid0=$(docker exec "$container" awk -F: '$3 == 0 {print $1}' /etc/passwd 2>/dev/null || true)
+        local uid0=$(container_exec "$container" awk -F: '$3 == 0 {print $1}' /etc/passwd 2>/dev/null || true)
         [ "$uid0" != "root" ] && [ -n "$uid0" ] && log_warning "容器 [$container] 发现多个UID为0账户: $uid0"
 
         # 口令期限
-        local maxdays=$(docker exec "$container" grep "^PASS_MAX_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}' || true)
+        local maxdays=$(container_exec "$container" grep "^PASS_MAX_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}' || true)
         [ "$maxdays" -gt "90" ] 2>/dev/null && log_warning "容器 [$container] 口令期限过长: $maxdays 天"
     done
 }
@@ -683,11 +799,11 @@ check_file_permissions() {
 
     for container in $CONTAINERS; do
         # 敏感文件权限
-        local shadow_perm=$(docker exec "$container" stat -c "%a" /etc/shadow 2>/dev/null || true)
+        local shadow_perm=$(container_exec "$container" stat -c "%a" /etc/shadow 2>/dev/null || true)
         log_info "容器 [$container] /etc/shadow 权限: $shadow_perm"
 
         # 无属主文件
-        local noowner=$(docker exec "$container" find /etc -nouser -o -nogroup 2>/dev/null | head -3 || true)
+        local noowner=$(container_exec "$container" find /etc -nouser -o -nogroup 2>/dev/null | head -3 || true)
         [ -n "$noowner" ] && log_warning "容器 [$container] 发现无属主文件"
     done
 }
@@ -699,7 +815,7 @@ check_brute_force_protection() {
     log_info "开始检查容器内暴力破解防护..."
 
     for container in $CONTAINERS; do
-        docker exec "$container" which fail2ban-server 2>/dev/null && log_success "容器 [$container] 已安装fail2ban" || log_warning "容器 [$container] 未安装fail2ban"
+        container_exec "$container" which fail2ban-server 2>/dev/null && log_success "容器 [$container] 已安装fail2ban" || log_warning "容器 [$container] 未安装fail2ban"
     done
 }
 
@@ -712,10 +828,10 @@ check_unsafe_functions() {
     local unsafe_funcs="strcpy strcat sprintf gets scanf"
 
     for container in $CONTAINERS; do
-        local cfiles=$(docker exec "$container" find /app /home /root -name "*.c" 2>/dev/null | head -10 || true)
+        local cfiles=$(container_exec "$container" find /app /home /root -name "*.c" 2>/dev/null | head -10 || true)
         for file in $cfiles; do
             for func in $unsafe_funcs; do
-                docker exec "$container" grep -l "$func" "$file" 2>/dev/null && log_warning "容器 [$container] 发现不安全函数 $func: $file"
+                container_exec "$container" grep -l "$func" "$file" 2>/dev/null && log_warning "容器 [$container] 发现不安全函数 $func: $file"
             done
         done
     done
@@ -763,7 +879,7 @@ main() {
 
     echo -e "${BLUE}目标容器:${NC}"
     for c in $CONTAINERS; do
-        local img=$(docker inspect "$c" --format '{{.Config.Image}}' 2>/dev/null || echo "?")
+        local img=$(container_inspect "$c" --format '{{.Config.Image}}' 2>/dev/null || echo "?")
         echo -e "  - ${GREEN}$c${NC} ($img)"
     done
     echo ""
