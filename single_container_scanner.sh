@@ -419,6 +419,14 @@ main_scan() {
     local NETSTAT_OUTPUT=$(netstat -tunlp 2>/dev/null || ss -tunlp 2>/dev/null)
     echo "$NETSTAT_OUTPUT"
 
+    # 创建nmap扫描结果目录
+    local NMAP_DIR="/tmp/nmap_scan_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$NMAP_DIR"
+    log_info "Nmap扫描结果保存目录: $NMAP_DIR"
+
+    # 收集需要扫描的SSL端口
+    local SSL_PORTS=""
+
     echo "$NETSTAT_OUTPUT" | while read -r line; do
         # 跳过标题行
         if [[ "$line" == Proto* ]] || [[ "$line" == Active* ]] || [[ "$line" == Netid* ]]; then
@@ -447,7 +455,7 @@ main_scan() {
         fi
 
         # SSL探测 (仅对常见HTTPS端口)
-        if [[ "$PORT" == "443" ]] || [[ "$PORT" == "8443" ]] || [[ "$PORT" == "9443" ]]; then
+        if [[ "$PORT" == "443" ]] || [[ "$PORT" == "8443" ]] || [[ "$PORT" == "9443" ]] || [[ "$PORT" == "8080" ]]; then
             log_cmd "timeout 3 openssl s_client -connect $IP:$PORT"
 
             local tmpfileSSL=$(mktemp)
@@ -465,6 +473,9 @@ main_scan() {
                 openssl x509 -noout -dates -subject < "$tmpfileSSL" 2>/dev/null | while read cert_line; do
                     log_detail "证书: $cert_line"
                 done
+
+                # 添加到SSL端口列表用于nmap扫描
+                SSL_PORTS="$SSL_PORTS $PORT"
             else
                 log_detail "未检测到SSL"
             fi
@@ -472,9 +483,139 @@ main_scan() {
         fi
     done
 
-    # ==================== 12. 调试工具检查 ====================
+    # ==================== 11.1 Nmap SSL加密套件检查 ====================
     echo ""
-    echo "--- 12. 调试工具检查 ---"
+    echo "--- 11.1 Nmap SSL 加密套件检查 ---"
+
+    if command -v nmap >/dev/null 2>&1; then
+        # 从netstat获取监听端口进行SSL扫描
+        local LISTEN_IPS=$(echo "$NETSTAT_OUTPUT" | grep LISTEN | awk '{print $4}' | cut -d: -f1 | sort -u | head -5)
+        local LISTEN_PORTS=$(echo "$NETSTAT_OUTPUT" | grep LISTEN | awk '{print $4}' | cut -d: -f2 | sort -nu | head -10)
+
+        for ip in $LISTEN_IPS; do
+            [ -z "$ip" ] && ip="127.0.0.1"
+            [ "$ip" = "0.0.0.0" ] && ip="127.0.0.1"
+            [ "$ip" = "::" ] && ip="::1"
+
+            for port in $LISTEN_PORTS; do
+                [ -z "$port" ] && continue
+
+                log_cmd "nmap --script ssl-enum-ciphers -p $port $ip" "扫描SSL加密套件"
+
+                local nmap_ssl_file="$NMAP_DIR/ssl_ciphers_${ip}_${port}"
+                nmap --script ssl-enum-ciphers -p "$port" "$ip" > "$nmap_ssl_file" 2>/dev/null
+
+                if [ -f "$nmap_ssl_file" ] && [ -s "$nmap_ssl_file" ]; then
+                    log_detail "结果已保存: $nmap_ssl_file"
+
+                    # 分析加密套件安全性
+                    if grep -qE "SSLv2|SSLv3|TLSv1.0|TLSv1.1" "$nmap_ssl_file"; then
+                        log_error "发现不安全的SSL/TLS协议版本"
+                        grep -E "SSLv2|SSLv3|TLSv1.0|TLSv1.1" "$nmap_ssl_file" | while read line; do
+                            log_detail "$line"
+                        done
+                    fi
+
+                    if grep -qE "RC2|RC4|DES|3DES|MD5|NULL|EXPORT|ANON|ADH|AECDH" "$nmap_ssl_file"; then
+                        log_error "发现弱加密套件"
+                        grep -E "RC2|RC4|DES|3DES|MD5|NULL|EXPORT|ANON|ADH|AECDH" "$nmap_ssl_file" | head -10 | while read line; do
+                            log_detail "$line"
+                        done
+                    fi
+
+                    if grep -q "compressors:\s*DEFLATE" "$nmap_ssl_file"; then
+                        log_warning "启用了压缩(可能存在CRIME攻击风险)"
+                    fi
+                fi
+            done
+        done
+    else
+        log_warning "nmap 未安装，跳过SSL加密套件检查"
+    fi
+
+    # ==================== 12. Nmap端口扫描 ====================
+    echo ""
+    echo "--- 12. Nmap 端口深度扫描 ---"
+
+    if command -v nmap >/dev/null 2>&1; then
+        log_info "开始Nmap端口扫描(结果保存到 $NMAP_DIR)..."
+
+        # 扫描目标
+        local SCAN_TARGET="127.0.0.1"
+
+        # 1. TCP指定端口扫描(21,23)
+        echo ""
+        log_cmd "nmap -sS -p 21,23 -A -v3 -n -oA $NMAP_DIR/tcp_2_ports --max-scan-delay 10 -Pn --reason $SCAN_TARGET"
+        log_info "扫描TCP端口 21,23..."
+        nmap -sS -p 21,23 -A -v3 -n -oA "$NMAP_DIR/tcp_2_ports" --max-scan-delay 10 -Pn --reason "$SCAN_TARGET" 2>/dev/null
+
+        if [ -f "$NMAP_DIR/tcp_2_ports.nmap" ]; then
+            log_success "TCP 21,23端口扫描完成"
+            log_detail "结果文件: $NMAP_DIR/tcp_2_ports.nmap"
+
+            # 显示关键发现
+            if grep -qi "open" "$NMAP_DIR/tcp_2_ports.nmap"; then
+                log_warning "发现开放端口:"
+                grep -i "open" "$NMAP_DIR/tcp_2_ports.nmap" | head -5 | while read line; do
+                    log_detail "$line"
+                done
+            fi
+        fi
+
+        # 2. TCP全端口扫描
+        echo ""
+        log_cmd "nmap -sS -p- -A -v3 -n -oA $NMAP_DIR/tcp -Pn --reason $SCAN_TARGET"
+        log_info "扫描TCP全端口(可能需要较长时间)..."
+        nmap -sS -p- -A -v3 -n -oA "$NMAP_DIR/tcp" -Pn --reason "$SCAN_TARGET" 2>/dev/null
+
+        if [ -f "$NMAP_DIR/tcp.nmap" ]; then
+            log_success "TCP全端口扫描完成"
+            log_detail "结果文件: $NMAP_DIR/tcp.nmap"
+
+            # 统计开放端口
+            local open_ports=$(grep -c "open" "$NMAP_DIR/tcp.nmap" 2>/dev/null || echo "0")
+            log_result "发现 $open_ports 个开放端口"
+
+            if [ "$open_ports" -gt "0" ]; then
+                grep "open" "$NMAP_DIR/tcp.nmap" | head -10 | while read line; do
+                    log_detail "$line"
+                done
+            fi
+        fi
+
+        # 3. UDP全端口扫描
+        echo ""
+        log_cmd "nmap -sU -p- -A -v3 -n -oA $NMAP_DIR/udp --max-scan-delay 10 -Pn --reason $SCAN_TARGET"
+        log_info "扫描UDP全端口(可能需要较长时间)..."
+        nmap -sU -p- -A -v3 -n -oA "$NMAP_DIR/udp" --max-scan-delay 10 -Pn --reason "$SCAN_TARGET" 2>/dev/null
+
+        if [ -f "$NMAP_DIR/udp.nmap" ]; then
+            log_success "UDP全端口扫描完成"
+            log_detail "结果文件: $NMAP_DIR/udp.nmap"
+
+            # 统计开放端口
+            local open_udp=$(grep -c "open\|open\|filtered" "$NMAP_DIR/udp.nmap" 2>/dev/null || echo "0")
+            log_result "发现 $open_udp 个开放/过滤的UDP端口"
+        fi
+
+        # 汇总nmap扫描结果
+        echo ""
+        log_info "=== Nmap扫描结果汇总 ==="
+        echo ""
+        echo "扫描结果文件:"
+        ls -la "$NMAP_DIR" 2>/dev/null | grep -E "\.nmap|\.xml|\.gnmap" | while read line; do
+            log_detail "$line"
+        done
+
+        log_info "Nmap扫描结果目录: $NMAP_DIR"
+
+    else
+        log_warning "nmap 未安装，跳过端口深度扫描"
+    fi
+
+    # ==================== 13. 调试工具检查 ====================
+    echo ""
+    echo "--- 13. 调试工具检查 ---"
     log_cmd "find / -type f \\( -name 'tcpdump' -o -name 'gdb' -o -name 'strace' -o -name 'nc' -o -name 'nmap' -o -name 'wireshark' \\)"
 
     local DEBUG_TOOLS=$(find / -type f \( -name 'tcpdump' -o -name 'gdb' -o -name 'strace' -o -name 'nc' -o -name 'nmap' -o -name 'wireshark' -o -name 'netcat' \) 2>/dev/null | grep -v '/nmap/rpc\|/locale')
@@ -514,6 +655,7 @@ main_scan() {
     echo -e "${YELLOW}中危问题: $MEDIUM_ISSUES${NC}"
     echo -e "${BLUE}总问题数: $TOTAL_ISSUES${NC}"
     echo ""
+    echo "Nmap扫描结果: $NMAP_DIR"
     echo "扫描完成时间: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "=========================================="
 }
