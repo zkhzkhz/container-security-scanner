@@ -147,6 +147,10 @@ scan_docker_container() {
     echo -e "  ${CYAN}→ 状态:${NC} $status"
     echo -e "  ${CYAN}→ PID:${NC} $pid"
 
+    # 创建宿主机结果目录
+    local HOST_RESULT_DIR="/root/sec_scan_results/${container}_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$HOST_RESULT_DIR"
+
     # 记录到日志
     {
         echo ""
@@ -155,6 +159,7 @@ scan_docker_container() {
         echo "镜像: $image"
         echo "状态: $status"
         echo "PID: $pid"
+        echo "结果目录: $HOST_RESULT_DIR"
         echo "========================================"
     } | tee -a "$LOG_FILE"
 
@@ -173,6 +178,20 @@ scan_docker_container() {
     if [ -f "$scanner_script" ]; then
         echo -e "${CYAN}[CMD]${NC} nsenter -t $pid -n -m -u -i -p -- bash -i $scanner_script"
         nsenter -t "$pid" -n -m -u -i -p -- bash -ic "$(cat "$scanner_script")" 2>&1 | tee -a "$LOG_FILE"
+
+        # 复制容器内的nmap扫描结果到宿主机
+        echo -e "${CYAN}[CMD]${NC} 复制nmap扫描结果到宿主机"
+        local container_nmap_dir=$(nsenter -t "$pid" -n -m -u -i -p -- bash -c "ls -d /tmp/nmap_scan_* 2>/dev/null | head -1" 2>/dev/null || true)
+        if [ -n "$container_nmap_dir" ]; then
+            echo -e "${GREEN}[INFO]${NC} 发现容器内nmap结果: $container_nmap_dir"
+            # 通过/proc复制文件
+            cp -r "/proc/$pid/root${container_nmap_dir}" "$HOST_RESULT_DIR/nmap_results" 2>/dev/null || \
+            nsenter -t "$pid" -n -m -u -i -p -- tar -czf - -C "$(dirname $container_nmap_dir)" "$(basename $container_nmap_dir)" 2>/dev/null | tar -xzf - -C "$HOST_RESULT_DIR" 2>/dev/null
+
+            if [ -d "$HOST_RESULT_DIR/nmap_results" ] || [ -d "$HOST_RESULT_DIR/$(basename $container_nmap_dir)" ]; then
+                echo -e "${GREEN}[OK]${NC} nmap结果已保存到: $HOST_RESULT_DIR"
+            fi
+        fi
     else
         echo -e "${RED}[ERROR]${NC} 找不到扫描脚本: $scanner_script"
     fi
@@ -209,6 +228,10 @@ scan_crictl_container() {
         return
     fi
 
+    # 创建宿主机结果目录
+    local HOST_RESULT_DIR="/root/sec_scan_results/${pod_namespace}_${pod_name}_${container_name}_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$HOST_RESULT_DIR"
+
     # 记录到日志
     {
         echo ""
@@ -217,6 +240,7 @@ scan_crictl_container() {
         echo "容器: $container_name ($container_id)"
         echo "镜像: $image"
         echo "PID: $pid"
+        echo "结果目录: $HOST_RESULT_DIR"
         echo "========================================"
     } | tee -a "$LOG_FILE"
 
@@ -235,6 +259,22 @@ scan_crictl_container() {
     if [ -f "$scanner_script" ]; then
         echo -e "${CYAN}[CMD]${NC} nsenter -t $pid -n -m -u -i -p -- bash -i $scanner_script"
         nsenter -t "$pid" -n -m -u -i -p -- bash -ic "$(cat "$scanner_script")" 2>&1 | tee -a "$LOG_FILE"
+
+        # 复制容器内的nmap扫描结果到宿主机
+        echo -e "${CYAN}[CMD]${NC} 复制nmap扫描结果到宿主机"
+        local container_nmap_dir=$(nsenter -t "$pid" -n -m -u -i -p -- bash -c "ls -d /tmp/nmap_scan_* 2>/dev/null | head -1" 2>/dev/null || true)
+        if [ -n "$container_nmap_dir" ]; then
+            echo -e "${GREEN}[INFO]${NC} 发现容器内nmap结果: $container_nmap_dir"
+            # 通过/proc复制文件
+            cp -r "/proc/$pid/root${container_nmap_dir}" "$HOST_RESULT_DIR/nmap_results" 2>/dev/null || \
+            nsenter -t "$pid" -n -m -u -i -p -- tar -czf - -C "$(dirname $container_nmap_dir)" "$(basename $container_nmap_dir)" 2>/dev/null | tar -xzf - -C "$HOST_RESULT_DIR" 2>/dev/null
+
+            if [ -d "$HOST_RESULT_DIR/nmap_results" ] || [ -d "$HOST_RESULT_DIR/$(basename $container_nmap_dir)" ]; then
+                echo -e "${GREEN}[OK]${NC} nmap结果已保存到: $HOST_RESULT_DIR"
+                # 列出保存的文件
+                ls -la "$HOST_RESULT_DIR" 2>/dev/null | tee -a "$LOG_FILE"
+            fi
+        fi
     else
         echo -e "${RED}[ERROR]${NC} 找不到扫描脚本: $scanner_script"
     fi
